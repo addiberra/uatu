@@ -1,3 +1,4 @@
+import { showSurface } from "./navigation-helpers";
 import type { APIRequestContext, Browser, Page } from "@playwright/test";
 
 import type { ChatCapability, ConversationItem, ConversationSnapshot } from "../../src/chat/types";
@@ -27,7 +28,7 @@ async function token(request: APIRequestContext): Promise<string> {
 async function openClient(page: Page, credential: string, conversationId: string): Promise<void> {
   await page.goto(`/?t=${encodeURIComponent(credential)}`);
   await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
-  if (await page.locator("html").getAttribute("data-ui-mode") === "touch") await page.locator("#touch-tab-chat").click();
+  if (await page.locator("html").getAttribute("data-ui-mode") === "touch") await showSurface(page, "chat");
   else await openChatPanel(page);
   await expect(page.locator("#chat-conversation-select")).toHaveValue(conversationId);
 }
@@ -119,7 +120,7 @@ for (const engine of ["chromium", "webkit"] as const) for (const touch of [false
       const credential = await token(request);
       await page.goto(`/?t=${encodeURIComponent(credential)}`);
       await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
-      if (touch) await page.locator("#touch-tab-chat").click(); else await openChatPanel(page);
+      if (touch) await showSurface(page, "chat"); else await openChatPanel(page);
       await page.getByRole("button", { name: "New conversation", exact: true }).click();
       await expect(page.locator("#chat-state")).toContainText("Started new conversation");
       const conversationId = await page.locator("#chat-conversation-select").inputValue();
@@ -189,7 +190,7 @@ for (const engine of ["chromium", "webkit"] as const) for (const touch of [false
       await expect(task(other)).toHaveCount(0);
       await other.reload();
       await expect(other.locator("#connection-state .connection-label")).toHaveText("Connected");
-      if (touch) await other.locator("#touch-tab-chat").click(); else await openChatPanel(other);
+      if (touch) await showSurface(other, "chat"); else await openChatPanel(other);
       await expect(other.locator("#chat-conversation-select")).toHaveValue(conversationId);
       await expect(other.locator("#chat-items")).toContainText("Retained base answer");
       await expect(other.locator("#chat-reverted-items .chat-reverted-message")).toHaveCount(1);

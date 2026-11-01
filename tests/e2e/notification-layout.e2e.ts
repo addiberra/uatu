@@ -1,3 +1,4 @@
+import { showSurface } from "./navigation-helpers";
 import type { Page } from "@playwright/test";
 import { expect, test as baseTest } from "./hub-fixtures";
 import { attachPageDiagnosticsOnFailure, withEngineBrowsers } from "./page-diagnostics";
@@ -60,7 +61,7 @@ for (const engine of ["chromium", "webkit"] as const) {
       await page.locator("#sidebar-expand").click();
       await page.locator("#ui-mode-toggle").click();
       await page.setViewportSize({ width: 390, height: 844 });
-      await page.locator("#touch-tab-files").click();
+      await showSurface(page, "files");
       await expectSidebarControlsFit(page);
       await captureScreenshot(page, testInfo, `${engine}-notifications-touch-files`);
       await page.locator(".sidebar-notifications-row").getByRole("button", { name: "Notifications", exact: true }).click();

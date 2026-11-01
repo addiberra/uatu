@@ -84,10 +84,13 @@ export function captureTerminalToken(): string | null {
     const url = new URL(window.location.href);
     const fromUrl = url.searchParams.get("t");
     if (fromUrl) {
-      window.sessionStorage.setItem(TERMINAL_TOKEN_KEY, fromUrl);
-      // Promote the URL token into a same-origin auth cookie. Fire-and-forget
-      // — failures aren't fatal because the in-memory token is still in
-      // sessionStorage and ?t= still works for this tab.
+      try { window.sessionStorage.setItem(TERMINAL_TOKEN_KEY, fromUrl); } catch {
+        // Storage denial must not skip promotion of the supplied credential
+        // to the existing same-origin cookie.
+      }
+      // Start same-origin cookie promotion before removing ?t=. If storage
+      // was denied, there is no sessionStorage fallback after URL cleanup;
+      // callers awaiting waitForWorkspaceCredential rely on this promotion.
       credentialPromotion = persistTerminalToken(fromUrl);
       url.searchParams.delete("t");
       const next = url.pathname + (url.search ? url.search : "") + url.hash;

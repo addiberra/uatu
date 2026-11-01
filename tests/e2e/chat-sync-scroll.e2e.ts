@@ -1,3 +1,4 @@
+import { showSurface } from "./navigation-helpers";
 import type { Locator, Page } from "@playwright/test";
 import { test as hubTest, expect, childChatControl, signIn, openSessionTab, openEventSources } from "./hub-fixtures";
 import { withEngineBrowsers } from "./page-diagnostics";
@@ -89,7 +90,7 @@ for (const engine of ["chromium", "webkit"] as const) for (const child of [false
       const control = (body: Record<string, unknown>) => childChatControl(workspace, { action: "opencode", ...body }) as Promise<any>;
       await childChatControl(workspace, { action: "agents", stack: "opencode-v2", backgroundPreview: true });
       const page = await openSessionTab(context, workspace);
-      await page.locator("#touch-tab-chat").tap();
+      await showSurface(page, "chat", "tap");
       await page.getByRole("button", { name: "New conversation" }).click();
       await expect(page.locator("#chat-conversation-select")).not.toHaveValue("");
       const parent = await page.locator("#chat-conversation-select").inputValue();
@@ -100,7 +101,7 @@ for (const engine of ["chromium", "webkit"] as const) for (const child of [false
       await control({ op: "appendHistory", conversationId: parent, count: 90 });
       await control({ op: "appendHistory", conversationId: worker.childId, count: 90 });
       await page.reload();
-      await page.locator("#touch-tab-chat").tap();
+      await showSurface(page, "chat", "tap");
       await expect(page.locator("#chat-items")).toContainText("Historical fixture answer 89");
       await page.locator("#chat-input").fill("Pending input survives native sync");
       await page.locator("#chat-input").press("Alt+Enter");

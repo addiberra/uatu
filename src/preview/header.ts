@@ -43,6 +43,18 @@ export { previewTitleElement, previewPathElement, previewTypeElement, previewBas
 // just owns the throw-if-null query so all `#preview-*` chrome lives here.
 export { outlineToggleButton, copySourceButton };
 
+/** Wrapped touch headings/actions must not obscure fragment destinations. */
+export function measurePreviewHeader(): void {
+  const header = previewTitleElement.closest<HTMLElement>(".preview-header");
+  if (header) document.documentElement.style.setProperty("--preview-header-height", `${header.getBoundingClientRect().height}px`);
+}
+
+export function initPreviewHeaderMeasurement(): void {
+  const header = previewTitleElement.closest<HTMLElement>(".preview-header");
+  if (header) new ResizeObserver(measurePreviewHeader).observe(header);
+  measurePreviewHeader();
+}
+
 // Hide the entire action-icon bar. Called when leaving document mode (commit /
 // empty previews) where neither copy-source nor an outline
 // makes sense. The Rendered-view + heading-count gating for the document case

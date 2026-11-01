@@ -76,8 +76,19 @@ const SWITCHER_STATE_COPY: Record<SwitcherRowState, string> = {
 
 let terminalSetupRan = false;
 
-const sessionStorageRef: StorageLike = presentationSessionStorage() ?? window.sessionStorage;
-const localStorageRef: StorageLike = presentationLocalStorage() ?? window.localStorage;
+function memoryStorage(): StorageLike {
+  const values = new Map<string, string>();
+  return {
+    getItem: key => values.get(key) ?? null,
+    setItem: (key, value) => { values.set(key, value); },
+    removeItem: key => { values.delete(key); },
+  };
+}
+
+// Navigation must still reach Terminal when a browser denies storage. Never
+// retry a denied getter outside the presentation owner's guard.
+const sessionStorageRef: StorageLike = presentationSessionStorage() ?? memoryStorage();
+const localStorageRef: StorageLike = presentationLocalStorage() ?? memoryStorage();
 
 function readTerminalVisiblePreference(): boolean {
   return readTerminalVisiblePreferenceShared(sessionStorageRef);

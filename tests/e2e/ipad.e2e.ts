@@ -6,6 +6,7 @@
 // device. A fine-pointer guard describe pins that desktop browsers never
 // see any of this chrome.
 
+import { showSurface } from "./navigation-helpers";
 import { expect, test } from "./fixtures";
 import { openTreeFile, treeRow } from "./tree-helpers";
 import { expectStageTransform, readStageTransform } from "./transform-helpers";
@@ -57,16 +58,18 @@ test.describe("iPad touch mode", () => {
     await expect(page.locator("html")).toHaveAttribute("data-active-tab", "preview");
     // The bar carries only the four surface tabs; the mode switch lives
     // in the sidebar header, i.e. the Files tab's surface.
-    await expect(page.locator("#touch-tab-bar button")).toHaveCount(4);
+    await expect(page.locator('#touch-tab-bar [role="tablist"] [role="tab"]')).toHaveCount(4);
+    await expect(page.locator("#navigation-close")).toBeVisible();
+    await expect(page.locator("#touch-tab-bar button:not([role=tab])")).toHaveCount(1);
     // One surface at a time applies on iPad exactly as on phones.
     await expect(page.locator(".sidebar")).toBeHidden();
     await expect(page.locator(".preview-shell")).toBeVisible();
-    await page.locator("#touch-tab-files").click();
+    await showSurface(page, "files");
     await expect(page.locator("#ui-mode-toggle")).toBeVisible();
   });
 
   test("the mode toggle round-trips to the full desktop rendering, persisted", async ({ page }) => {
-    await page.locator("#touch-tab-files").click();
+    await showSurface(page, "files");
     await page.locator("#ui-mode-toggle").click();
 
     // The full desktop layout: mode stamped, bar gone, sidebar + preview
@@ -94,7 +97,7 @@ test.describe("iPad touch mode", () => {
   });
 
   test("desktop mode is never a trap: the toggle survives rotation and sidebar collapse", async ({ page }) => {
-    await page.locator("#touch-tab-files").click();
+    await showSurface(page, "files");
     await page.locator("#ui-mode-toggle").click();
     await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "desktop");
     await expect(page.locator("#ui-mode-toggle")).toBeVisible();
@@ -133,14 +136,14 @@ test.describe("iPad touch mode", () => {
     await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
 
     // Touch: the Terminal tab promotes to fullscreen.
-    await page.locator("#touch-tab-terminal").click();
+    await showSurface(page, "terminal");
     await expect(page.locator("#terminal-panel")).toHaveAttribute("data-display", "fullscreen");
     await expect(page.locator(".terminal-pane-host .xterm").first()).toBeVisible({ timeout: 5000 });
 
     // Desktop (via the Files tab's mode toggle): the stored mode (normal,
     // bottom dock) comes back — the promotion never overwrote it — with
     // the same pane still attached.
-    await page.locator("#touch-tab-files").click();
+    await showSurface(page, "files");
     await page.locator("#ui-mode-toggle").click();
     await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "desktop");
     await expect(page.locator("#terminal-panel")).toBeVisible();
@@ -153,7 +156,7 @@ test.describe("iPad touch mode", () => {
     // Terminal tab re-promotes the SAME pane, PTY intact.
     await page.locator("#ui-mode-toggle").click();
     await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
-    await page.locator("#touch-tab-terminal").click();
+    await showSurface(page, "terminal");
     await expect(page.locator("#terminal-panel")).toHaveAttribute("data-display", "fullscreen");
     await expect(page.locator(".terminal-pane")).toHaveCount(1);
     await expect(page.locator(".terminal-auth")).toHaveCount(0);
@@ -218,9 +221,9 @@ test.describe("iPad mermaid viewer", () => {
   test("in touch mode the toolbar is reachable with 44px targets", async ({ page, request }) => {
     await bootClean(page, request);
     await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
-    await page.locator("#touch-tab-files").click();
+    await showSurface(page, "files");
     await openTreeFile(page, "diagram.md");
-    await page.locator("#touch-tab-preview").click();
+    await showSurface(page, "preview");
     await openDiagramViewer(page);
 
     const geometry = await toolbarGeometry(page);
@@ -242,7 +245,7 @@ test.describe("iPad mermaid viewer", () => {
     // The affordance follows the input device, not the persisted mode. An
     // iPad in desktop mode gets the desktop layout but keeps 44px controls.
     await bootClean(page, request);
-    await page.locator("#touch-tab-files").click();
+    await showSurface(page, "files");
     await page.locator("#ui-mode-toggle").click();
     await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "desktop");
 
@@ -259,9 +262,9 @@ test.describe("iPad mermaid viewer", () => {
 
   test("pinch zoom and double-tap fit work on iPad", async ({ page, request }) => {
     await bootClean(page, request);
-    await page.locator("#touch-tab-files").click();
+    await showSurface(page, "files");
     await openTreeFile(page, "diagram.md");
-    await page.locator("#touch-tab-preview").click();
+    await showSurface(page, "preview");
     await openDiagramViewer(page);
 
     const send = async (

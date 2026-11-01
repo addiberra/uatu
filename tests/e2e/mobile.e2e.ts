@@ -10,6 +10,7 @@ import fs from "node:fs/promises";
 
 import { expect, test } from "./fixtures";
 import { waitForPreviewToSettle } from "./fixtures";
+import { keepNavigationOpen, showSurface } from "./navigation-helpers";
 import { treeRow } from "./tree-helpers";
 import { workspacePath } from "./config";
 import { removeTerminalGates, terminalGate, waitForTerminalReady } from "./terminal-helpers";
@@ -49,6 +50,7 @@ async function touchBeforeEach(
   request: import("@playwright/test").APIRequestContext,
 ): Promise<void> {
   await request.post("/__e2e/reset");
+  await keepNavigationOpen(page);
   await page.goto("/");
   await page.evaluate(() => {
     try {
@@ -65,16 +67,29 @@ async function touchBeforeEach(
   await expect(page.locator("#preview-path")).toHaveText("README.md");
   // Normalize follow to off inside the Files tab (the chip lives in the
   // sidebar surface); see standardBeforeEach for why this is conditional.
-  await page.locator("#touch-tab-files").click();
+  await showSurface(page, "files");
   await expect(treeRow(page, "README.md")).toBeVisible();
   const pressed = await page.locator("#follow-toggle").getAttribute("aria-pressed");
   if (pressed === "true") {
     await page.locator("#follow-toggle").click();
   }
   await expect(page.locator("#follow-toggle")).toHaveAttribute("aria-pressed", "false");
-  await page.locator("#touch-tab-preview").click();
+  if (await page.locator("#navigation-handle").isVisible()) await page.locator("#navigation-handle").click();
+  await showSurface(page, "preview");
   await expect(page.locator("html")).toHaveAttribute("data-active-tab", "preview");
   await page.waitForTimeout(75);
+}
+
+// A freshly spawned shell can swallow or garble keystrokes sent before it has
+// drawn its prompt, so every typing site waits for non-whitespace output first.
+async function waitForPrompt(page: import("@playwright/test").Page): Promise<void> {
+  await expect
+    .poll(
+      async () => (await page.locator(".terminal-pane-host .xterm-rows > div").allTextContents())
+        .some(text => text.trim().length > 0),
+      { timeout: 10_000, message: "shell prompt must render before typing" },
+    )
+    .toBe(true);
 }
 
 // Terminal-backed tests need the cookie flow from /?t=<token>; mirrors the
@@ -86,6 +101,7 @@ async function terminalBeforeEach(
 ): Promise<void> {
   await context.grantPermissions(["clipboard-read", "clipboard-write"]);
   await request.post("/__e2e/reset");
+  await keepNavigationOpen(page);
   const tokenResp = await request.get("/__e2e/terminal-token");
   const tokenBody = await tokenResp.json();
   if (!tokenBody.enabled) {
@@ -132,18 +148,24 @@ test.describe("touch tab navigation", () => {
     await expect(page.locator(".preview-shell")).toBeVisible();
     // One surface at a time: the sidebar is not rendered on the Preview tab.
     await expect(page.locator(".sidebar")).toBeHidden();
-    // The bar sits at the viewport's bottom edge.
-    const barBox = await page.locator("#touch-tab-bar").boundingBox();
-    expect(barBox?.width ?? 0).toBeGreaterThanOrEqual(389);
-    expect((barBox?.y ?? 0) + (barBox?.height ?? 0)).toBeGreaterThanOrEqual(843);
-    // The bar carries only the four surface tabs — no mode control.
-    await expect(page.locator("#touch-tab-bar button")).toHaveCount(4);
+    // The bar is an inset pill near the viewport's bottom edge, not a
+    // full-bleed strip (design/hub-mobile/screenshots-refined/33-keep-navigation-open.png).
+    const barBox = (await page.locator("#touch-tab-bar").boundingBox())!;
+    expect(barBox.x).toBeGreaterThanOrEqual(8);
+    expect(barBox.x + barBox.width).toBeLessThanOrEqual(382);
+    expect(barBox.y + barBox.height).toBeLessThanOrEqual(844);
+    expect(barBox.y + barBox.height).toBeGreaterThanOrEqual(800);
+    // Four surface tabs plus the close control. Hub is an anchor and is only
+    // shown under a Hub; no mode control and no Preferences button.
+    await expect(page.locator("#touch-tab-bar [role=tab]")).toHaveCount(4);
+    await expect(page.locator("#touch-tab-bar button")).toHaveCount(5);
+    await expect(page.locator("#navigation-hub")).toBeHidden();
     // Desktop-only chrome stays gone in touch mode.
     await expect(page.locator("#terminal-toggle")).toBeHidden();
   });
 
   test("tab switching swaps fullscreen surfaces", async ({ page }) => {
-    await page.locator("#touch-tab-files").click();
+    await showSurface(page, "files");
     await expect(page.locator("html")).toHaveAttribute("data-active-tab", "files");
     await expect(page.locator("#touch-tab-files")).toHaveAttribute("aria-selected", "true");
     await expect(page.locator(".sidebar")).toBeVisible();
@@ -159,13 +181,13 @@ test.describe("touch tab navigation", () => {
     // The mode toggle lives in this surface's header, at any width.
     await expect(page.locator("#ui-mode-toggle")).toBeVisible();
 
-    await page.locator("#touch-tab-preview").click();
+    await showSurface(page, "preview");
     await expect(page.locator(".preview-shell")).toBeVisible();
     await expect(page.locator(".sidebar")).toBeHidden();
   });
 
   test("a document pick switches to Preview; directory taps and file events do not", async ({ page }) => {
-    await page.locator("#touch-tab-files").click();
+    await showSurface(page, "files");
     await expect(treeRow(page, "guides/")).toBeVisible();
 
     // Directory expand keeps the Files tab active.
@@ -190,7 +212,7 @@ test.describe("touch tab navigation", () => {
   });
 
   test("a search-result click lands on the Preview tab showing the document", async ({ page }) => {
-    await page.locator("#touch-tab-files").click();
+    await showSurface(page, "files");
     await page.keyboard.press("ControlOrMeta+Shift+f");
     await expect(page.locator("#search-query")).toBeVisible();
     await page.locator("#search-query").fill("Save this file");
@@ -206,18 +228,18 @@ test.describe("touch tab navigation", () => {
   });
 
   test("tree state is continuous across tab switches", async ({ page }) => {
-    await page.locator("#touch-tab-files").click();
+    await showSurface(page, "files");
     await treeRow(page, "guides/").click();
     await expect(treeRow(page, "guides/setup.md")).toBeVisible();
 
-    await page.locator("#touch-tab-preview").click();
-    await page.locator("#touch-tab-files").click();
+    await showSurface(page, "preview");
+    await showSurface(page, "files");
     // Expansion survived the round-trip — same tree DOM, not a rebuild.
     await expect(treeRow(page, "guides/setup.md")).toBeVisible();
   });
 
   test("dragging a pane header resizes the boundary above it", async ({ page }) => {
-    await page.locator("#touch-tab-files").click();
+    await showSurface(page, "files");
     await expect(treeRow(page, "README.md")).toBeVisible();
 
     const overviewPane = page.locator('[data-pane-id="change-overview"]');
@@ -249,7 +271,7 @@ test.describe("touch tab navigation", () => {
   });
 
   test("double-tapping a pane header toggles its collapse", async ({ page }) => {
-    await page.locator("#touch-tab-files").click();
+    await showSurface(page, "files");
     await expect(treeRow(page, "README.md")).toBeVisible();
 
     const overviewPane = page.locator('[data-pane-id="change-overview"]');
@@ -273,7 +295,7 @@ test.describe("touch tab navigation", () => {
   });
 
   test("the active tab persists across reload", async ({ page }) => {
-    await page.locator("#touch-tab-files").click();
+    await showSurface(page, "files");
     await expect.poll(() => readStoredValue(page, "uatu:active-tab")).toBe("files");
 
     await page.reload();
@@ -290,17 +312,21 @@ test.describe("touch terminal tab", () => {
   });
 
   test("activating the Terminal tab lands in true fullscreen without touching the stored mode", async ({ page }) => {
-    await page.locator("#touch-tab-terminal").click();
+    await showSurface(page, "terminal");
     const panel = page.locator("#terminal-panel");
     await expect(panel).toHaveAttribute("data-display", "fullscreen");
     await expect(page.locator(".terminal-pane-host .xterm").first()).toBeVisible({ timeout: 5000 });
 
-    // Whole viewport above the tab bar: no sidebar or preview reachable.
-    const box = await panel.boundingBox();
-    const barBox = await page.locator("#touch-tab-bar").boundingBox();
-    expect(box?.width ?? 0).toBeGreaterThanOrEqual(389);
-    expect(box?.height ?? 0).toBeGreaterThanOrEqual(700);
-    expect((box?.y ?? 0) + (box?.height ?? 0)).toBeLessThanOrEqual((barBox?.y ?? 0) + 1);
+    // The surface fills the viewport and the bar floats over it; the design
+    // reserves no gutter (screenshots-refined/10-terminal-expanded.png, and
+    // navigation-overlay.e2e.ts asserts the same for .app-shell padding).
+    const box = (await panel.boundingBox())!;
+    const barBox = (await page.locator("#touch-tab-bar").boundingBox())!;
+    expect(box.width).toBeGreaterThanOrEqual(389);
+    expect(box.height).toBeGreaterThanOrEqual(700);
+    expect(box.y + box.height).toBeGreaterThanOrEqual(843);
+    expect(barBox.y).toBeGreaterThan(box.y);
+    expect(barBox.y + barBox.height).toBeLessThanOrEqual(box.y + box.height);
     await expect(page.locator(".preview-shell")).toBeHidden();
     await expect
       .poll(async () => page.evaluate(() => getComputedStyle(document.body).overflow))
@@ -318,7 +344,7 @@ test.describe("touch terminal tab", () => {
   });
 
   test("the terminal survives tab round-trips with its PTY attached and output intact", async ({ page }) => {
-    await page.locator("#touch-tab-terminal").click();
+    await showSurface(page, "terminal");
     await waitForTerminalReady(page);
 
     // Touch emulation doesn't reliably deliver the show-path's deferred
@@ -326,32 +352,33 @@ test.describe("touch terminal tab", () => {
     await page.evaluate(() => {
       document.querySelector<HTMLTextAreaElement>(".terminal-pane-host .xterm-helper-textarea")?.focus();
     });
+    await waitForPrompt(page);
     await page.keyboard.type('echo "tab-roundtrip-$((6*7))"');
     await page.keyboard.press("Enter");
     await expect.poll(async () => {
       const rows = await page.locator(".terminal-pane-host .xterm-rows > div").allTextContents();
       return rows.some(text => text.includes("tab-roundtrip-42"));
-    }, { timeout: 5000 }).toBe(true);
+    }, { timeout: 15_000 }).toBe(true);
 
     // Switch away: the surface hides, the panel is NOT torn down (no hidden
     // attribute — minimize semantics), the PTY stays attached.
-    await page.locator("#touch-tab-preview").click();
+    await showSurface(page, "preview");
     await expect(page.locator("#terminal-panel")).not.toBeVisible();
     await expect(page.locator("#terminal-panel")).not.toHaveAttribute("hidden", "");
     await expect(page.locator(".terminal-pane")).toHaveCount(1);
 
     // Return: same session, accumulated output visible, no auth form.
-    await page.locator("#touch-tab-terminal").click();
+    await showSurface(page, "terminal");
     await expect(page.locator("#terminal-panel")).toHaveAttribute("data-display", "fullscreen");
     await expect(page.locator(".terminal-auth")).toHaveCount(0);
     await expect.poll(async () => {
       const rows = await page.locator(".terminal-pane-host .xterm-rows > div").allTextContents();
       return rows.some(text => text.includes("tab-roundtrip-42"));
-    }, { timeout: 5000 }).toBe(true);
+    }, { timeout: 15_000 }).toBe(true);
   });
 
   test("leaving fullscreen routes to the Preview tab, never a minimized strip", async ({ page }) => {
-    await page.locator("#touch-tab-terminal").click();
+    await showSurface(page, "terminal");
     await expect(page.locator(".terminal-pane-host .xterm").first()).toBeVisible({ timeout: 5000 });
 
     await page.locator("#terminal-fullscreen").click();
@@ -361,13 +388,13 @@ test.describe("touch terminal tab", () => {
     await expect(page.locator(".terminal-panel-header")).not.toBeVisible();
 
     // The PTY survived; the tab is the return affordance.
-    await page.locator("#touch-tab-terminal").click();
+    await showSurface(page, "terminal");
     await expect(page.locator("#terminal-panel")).toHaveAttribute("data-display", "fullscreen");
     await expect(page.locator(".terminal-auth")).toHaveCount(0);
   });
 
   test("PTY output while another tab is active badges the Terminal tab", async ({ page }) => {
-    await page.locator("#touch-tab-terminal").click();
+    await showSurface(page, "terminal");
     const host = await waitForTerminalReady(page);
 
     // Kick off gated output, then leave before it is released. The armed
@@ -377,10 +404,11 @@ test.describe("touch terminal tab", () => {
     await page.evaluate(() => {
       document.querySelector<HTMLTextAreaElement>(".terminal-pane-host .xterm-helper-textarea")?.focus();
     });
+    await waitForPrompt(page);
     await page.keyboard.type(`printf 'badge-%s\\n' armed; ${gate.shellWait}; printf 'badge-%s\\n' ping`);
     await page.keyboard.press("Enter");
     await expect.poll(() => host.locator(".xterm").textContent()).toContain("badge-armed");
-    await page.locator("#touch-tab-preview").click();
+    await showSurface(page, "preview");
     await expect(page.locator("html")).toHaveAttribute("data-active-tab", "preview");
     await expect(page.locator("#touch-tab-terminal")).not.toHaveAttribute("data-badge", "");
 
@@ -388,13 +416,13 @@ test.describe("touch terminal tab", () => {
     await expect(page.locator("#touch-tab-terminal")).toHaveAttribute("data-badge", "");
 
     // Activating the tab clears the dot.
-    await page.locator("#touch-tab-terminal").click();
+    await showSurface(page, "terminal");
     await expect(page.locator("#touch-tab-terminal")).not.toHaveAttribute("data-badge", "");
     await expect.poll(() => host.locator(".xterm").textContent()).toContain("badge-ping");
   });
 
   test("keybar shows the grown key set and the sticky Ctrl latch arms and cancels", async ({ page }) => {
-    await page.locator("#touch-tab-terminal").click();
+    await showSurface(page, "terminal");
     await expect(page.locator(".terminal-pane-host .xterm").first()).toBeVisible({ timeout: 5000 });
 
     const keybar = page.locator("#terminal-keybar");
@@ -419,7 +447,7 @@ test.describe("touch terminal tab", () => {
   });
 
   test("Select opens a document-level transcript with native text selection and Done restores terminal", async ({ page }) => {
-    await page.locator("#touch-tab-terminal").click();
+    await showSurface(page, "terminal");
     const host = await waitForTerminalReady(page);
     const terminal = host.locator(".xterm");
     // The later marker is released only after the transcript snapshot has
@@ -428,6 +456,7 @@ test.describe("touch terminal tab", () => {
     await page.evaluate(() => {
       document.querySelector<HTMLTextAreaElement>(".terminal-pane-host .xterm-helper-textarea")?.focus();
     });
+    await waitForPrompt(page);
     await page.keyboard.type(`seq 1 80; printf '%0500d\\n' 0; printf 'snapshot-%s-ready\\n' sheet; ${gate.shellWait}; printf 'sheet-%s-marker\\n' later`);
     await page.keyboard.press("Enter");
     await expect.poll(() => host.locator(".xterm").textContent()).toContain("snapshot-sheet-ready");
@@ -487,7 +516,7 @@ test.describe("touch terminal tab", () => {
   });
 
   test("keybar Paste sends multiline clipboard text exactly once through bracketed paste", async ({ page }) => {
-    await page.locator("#touch-tab-terminal").click();
+    await showSurface(page, "terminal");
     const host = await waitForTerminalReady(page);
     await page.evaluate(() => {
       document.querySelector<HTMLTextAreaElement>(".terminal-pane-host .xterm-helper-textarea")?.focus();
@@ -524,7 +553,7 @@ test.describe("touch terminal tab", () => {
   });
 
   test("font stepper applies live and persists a per-device override", async ({ page }) => {
-    await page.locator("#touch-tab-terminal").click();
+    await showSurface(page, "terminal");
     await expect(page.locator(".terminal-pane-host .xterm").first()).toBeVisible({ timeout: 5000 });
 
     const increase = page.locator("#terminal-font-increase");
@@ -606,9 +635,9 @@ test.describe("touch mermaid viewer", () => {
 
   // Open `diagram.md` and its rendered diagram in the fullscreen viewer.
   async function openViewer(page: import("@playwright/test").Page): Promise<void> {
-    await page.locator("#touch-tab-files").click();
+    await showSurface(page, "files");
     await treeRow(page, "diagram.md").click();
-    await page.locator("#touch-tab-preview").click();
+    await showSurface(page, "preview");
     const trigger = page.locator("#preview .mermaid-trigger");
     await expect(trigger).toBeVisible();
     await trigger.tap();

@@ -1,3 +1,4 @@
+import { showSurface } from "./navigation-helpers";
 import { test as base, expect } from "./fixtures";
 import { withEngineBrowsers } from "./page-diagnostics";
 import { writeFile } from "node:fs/promises";
@@ -16,7 +17,7 @@ test("sparse pending entries grow from one to two to five beside busy workers", 
     await request.post("/__e2e/chat", { data: { action: "agents", stack: "opencode-v2", backgroundPreview: true } });
     const { token } = await request.get("/__e2e/terminal-token").then(r => r.json());
     await page.goto(`/?t=${encodeURIComponent(token)}`);
-    await page.locator("#touch-tab-chat").click();
+    await showSurface(page, "chat");
     await page.getByRole("button", { name: "New conversation", exact: true }).click();
     await expect(page.locator("#chat-conversation-select")).not.toHaveValue("");
     await page.locator("#chat-input").fill("Implement the example task list");
@@ -56,7 +57,7 @@ test("hold portal matches Send when the fixed viewport origin differs from clien
   await request.post("/__e2e/chat", { data: { action: "agents", stack: "opencode-v2", backgroundPreview: true } });
   const { token } = await request.get("/__e2e/terminal-token").then(r => r.json());
   await page.goto(`/?t=${encodeURIComponent(token)}`);
-  await page.locator("#touch-tab-chat").click();
+  await showSurface(page, "chat");
   await page.getByRole("button", { name: "New conversation", exact: true }).click();
   await expect(page.locator("#chat-conversation-select")).not.toHaveValue("");
   await page.locator("#chat-input").fill("Start work"); await page.locator("#chat-send").click();
@@ -151,7 +152,7 @@ for (const touch of [false, true]) for (const theme of ["light", "dark"] as cons
   await request.post("/__e2e/chat", { data: { action: "agents", stack: "opencode-v2", backgroundPreview: true } });
   const { token } = await request.get("/__e2e/terminal-token").then(r => r.json());
   await page.goto(`/?t=${encodeURIComponent(token)}`);
-  if (touch) await page.locator("#touch-tab-chat").click();
+  if (touch) await showSurface(page, "chat");
   else await page.locator("#chat-expand").click();
   await page.getByRole("button", { name: "New conversation", exact: true }).click();
   await expect(page.locator("#chat-state")).toContainText("Started new conversation with OpenCode");

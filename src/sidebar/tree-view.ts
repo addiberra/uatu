@@ -12,6 +12,7 @@
 import { FileTree, themeToTreeStyles, type FileTreeDirectoryHandle, type FileTreeItemHandle, type GitStatusEntry, type TreeThemeStyles } from "@pierre/trees";
 
 import type { DocumentMeta, RepositorySnapshot, RootGroup } from "../shared/types";
+import { compareTreeEntries } from "../shared/file-order";
 import type { DocumentPatch } from "../shared/document-updates";
 import { activeColorScheme, onColorSchemeChange, type ColorScheme } from "../shell/theme";
 
@@ -274,6 +275,7 @@ export class TreeView {
       // ("Tree-mount user-click guard").
       this.withProgrammaticUpdate(initialSelectedPath, () => {
         this.tree = new FileTree({
+          sort: compareTreeEntries,
           paths: renderedPaths,
           initialExpansion: "closed",
           initialExpandedPaths: autoExpanded,

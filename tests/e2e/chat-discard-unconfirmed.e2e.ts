@@ -1,3 +1,4 @@
+import { showSurface } from "./navigation-helpers";
 import type { APIRequestContext, Page } from "@playwright/test";
 import { openChatPanel } from "./chat-helpers";
 import { captureScreenshot, saveEvidence } from "./evidence";
@@ -18,7 +19,7 @@ async function heldAdmissionFixture(page: Page, request: APIRequestContext, mode
   const { token } = await request.get("/__e2e/terminal-token").then(response => response.json()) as { token: string };
   await page.goto(`/?t=${encodeURIComponent(token)}`);
   await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
-  if (mode === "touch") await page.locator("#touch-tab-chat").tap(); else await openChatPanel(page);
+  if (mode === "touch") await showSurface(page, "chat", "tap"); else await openChatPanel(page);
   await page.getByRole("button", { name: "New conversation" }).click();
   await expect(page.locator("#chat-conversation-select")).not.toHaveValue("");
   const conversationId = await page.locator("#chat-conversation-select").inputValue();
@@ -136,7 +137,7 @@ for (const browserName of ["chromium", "webkit"] as const) for (const mode of ["
     const { token } = await request.get("/__e2e/terminal-token").then(response => response.json()) as { token: string };
     await page.goto(`/?t=${encodeURIComponent(token)}`);
     await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
-    if (mode === "touch") await page.locator("#touch-tab-chat").tap(); else await openChatPanel(page);
+    if (mode === "touch") await showSurface(page, "chat", "tap"); else await openChatPanel(page);
     await page.getByRole("button", { name: "New conversation" }).click();
     await expect(page.locator("#chat-conversation-select")).not.toHaveValue("");
     const conversationId = await page.locator("#chat-conversation-select").inputValue();
@@ -268,7 +269,7 @@ for (const browserName of ["chromium", "webkit"] as const) for (const mode of ["
     const { token } = await request.get("/__e2e/terminal-token").then(response => response.json()) as { token: string };
     await page.goto(`/?t=${encodeURIComponent(token)}`);
     await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
-    if (mode === "touch") await page.locator("#touch-tab-chat").tap(); else await openChatPanel(page);
+    if (mode === "touch") await showSurface(page, "chat", "tap"); else await openChatPanel(page);
     // Independent real HTTP/native-fake setup. Only the rendered UI may
     // authorize either discard; two conversations make target ownership visible.
     const prepare = async (owner: "A" | "B") => {

@@ -1,3 +1,4 @@
+import { showSurface } from "./navigation-helpers";
 import type { APIRequestContext, Page } from "@playwright/test";
 import { expect } from "./fixtures";
 import { openChatPanel, openChatPending } from "./chat-helpers";
@@ -12,7 +13,7 @@ export async function enlargedPendingFixture(page: Page, request: APIRequestCont
   const { token } = await request.get("/__e2e/terminal-token").then(response => response.json());
   await page.goto(`/?t=${encodeURIComponent(token)}`);
   await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
-  if (await page.locator("html").getAttribute("data-ui-mode") === "touch") await page.locator("#touch-tab-chat").tap();
+  if (await page.locator("html").getAttribute("data-ui-mode") === "touch") await showSurface(page, "chat", "tap");
   else await openChatPanel(page);
   await expect(page.locator("#chat-state")).not.toContainText("Loading chat");
   await page.getByRole("button", { name: "New conversation" }).click();

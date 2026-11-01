@@ -121,9 +121,8 @@ export async function loadInitialState(onWorkspaceReady?: () => void) {
   } else {
     setFollowEnabled(false);
     const requestedDoc = findDocumentByRelativePath(urlRelativePath);
-    if (requestedDoc && isFollowableFile(requestedDoc)) {
-      // Direct link to a known document or previewable image (the URL a
-      // followed image left in the address bar) — force follow off (Rule
+    if (requestedDoc) {
+      // Direct link to any indexed file, including a binary fallback — force follow off (Rule
       // "URL direct links force OFF on boot") and override the
       // server-provided default selection.
       setSelectedId(requestedDoc.id);
@@ -185,7 +184,7 @@ export async function loadInitialState(onWorkspaceReady?: () => void) {
   if (appState.previewMode.kind === "document" && appState.selectedId) {
     const selected = findDocumentById(appState.selectedId);
     if (selected) {
-      replaceSelection(appState.selectedId, selected.relativePath);
+      replaceSelection(appState.selectedId, selected.relativePath, initialHash);
     }
   }
 

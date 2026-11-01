@@ -1,3 +1,4 @@
+import { openNavigation, showSurface } from "./navigation-helpers";
 import type { APIRequestContext, Locator, Page } from "@playwright/test";
 
 import type { ConversationItem } from "../../src/chat/types";
@@ -25,7 +26,7 @@ async function boot(page: Page, request: APIRequestContext, seed?: { items: Conv
   const token = await request.get("/__e2e/terminal-token").then(response => response.json()) as { token: string };
   await page.goto(`/?t=${encodeURIComponent(token.token)}`);
   await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
-  await page.locator("#touch-tab-chat").click();
+  await showSurface(page, "chat");
   await expect(page.locator("#chat-surface")).toBeVisible();
   await expect(page.locator("#chat-conversation-select")).toHaveValue(snapshot.conversation.id);
   await expect(page.locator("body")).toHaveCSS("overflow", "hidden");
@@ -113,7 +114,7 @@ async function bootWithPinnedTracks(page: Page, request: APIRequestContext, hist
   const token = await request.get("/__e2e/terminal-token").then(response => response.json()) as { token: string };
   await page.goto(`/?t=${encodeURIComponent(token.token)}`);
   await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
-  await page.locator("#touch-tab-chat").click();
+  await showSurface(page, "chat");
   await expect(page.locator("#chat-surface")).toBeVisible();
   await page.locator("#chat-conversation-select").selectOption(parent.conversation.id);
   await expect(page.locator("#chat-items")).toContainText("work through the list");
@@ -177,13 +178,13 @@ test("keeps workspace identity above full-width conversation controls", async ({
 test("four tabs preserve chat state and keyboard navigation", async ({ page, request }) => {
   await boot(page, request);
   await expect(page.locator("#touch-tab-bar [role=tab]")).toHaveCount(4);
-  await expect(page.locator("#touch-tab-bar .touch-tab-label")).toHaveText(["Files", "Preview", "Chat", "Terminal"]);
+  await expect(page.locator('#touch-tab-bar [role="tab"] .touch-tab-label')).toHaveText(["Files", "Preview", "Chat", "Terminal"]);
   await page.locator("#chat-input").fill("persistent touch draft");
   await expect(page.locator("#touch-tab-bar")).toBeHidden();
   await page.locator("#chat-input").blur();
-  await expect(page.locator("#touch-tab-bar")).toBeVisible();
+  await openNavigation(page);
   for (const tab of ["files", "preview", "chat"] as const) {
-    await page.locator(`#touch-tab-${tab}`).click();
+    await showSurface(page, tab);
     await expect(page.locator(`#touch-tab-${tab}`)).toHaveAttribute("aria-selected", "true");
   }
   await expect(page.locator("#chat-input")).toHaveValue("persistent touch draft");
@@ -313,9 +314,9 @@ test("a subagent transcript pushes as a screen and the back gesture pops it", as
   const drilldown = page.locator("#chat-drilldown");
   await expect(drilldown).toBeVisible();
   await expect(page.locator("#chat-drilldown-items")).toContainText("child findings");
-  // A layer within the Chat tab, not a way out of it: the tab bar is still
-  // there and Chat is still the selected tab.
-  await expect(page.locator("#touch-tab-bar")).toBeVisible();
+  // A layer within Chat, not a way out of it: outside interaction dismissed
+  // the overlay, but navigation remains reachable and Chat stays selected.
+  await expect(page.locator("#navigation-handle")).toBeVisible();
   await expect(page.locator("#touch-tab-chat")).toHaveAttribute("aria-selected", "true");
   // The picker is behind the pushed screen and still on the parent — a
   // subagent is never one of its entries.
@@ -646,7 +647,7 @@ const freeFormQuestion = (id: string, createdAt: number): ConversationItem => ({
   }],
 });
 
-test("answering a request on touch puts the chrome under the keyboard and brings it back on blur", async ({ page, request }) => {
+test("answering a request on touch restores the full surface on blur without reopening navigation", async ({ page, request }) => {
   // The chrome that cannot be acted on while the answer is being typed is not
   // taken away for it: the surface keeps its layout height, so the keyboard
   // simply covers the composer and the pinned tracks. They are under it rather
@@ -717,15 +718,14 @@ test("answering a request on touch puts the chrome under the keyboard and brings
     };
   })).toEqual({ composerBottom: true, tasksBottom: true });
 
-  // And with the keyboard gone the surface is the whole screen again, minus
-  // the tab bar the blur brought back — so the height is read against the bar
-  // rather than pinned to 844.
+  // Dismissing the keyboard restores the full surface, not a reserved tab
+  // gutter. Resolving a question must not implicitly reopen navigation.
   await setVisualViewport(page, { height: 844 });
-  await expect(page.locator("#touch-tab-bar")).toBeVisible();
+  await expect(page.locator("#touch-tab-bar")).toBeHidden();
+  await expect(page.locator("#navigation-handle")).toBeVisible();
   await expect.poll(() => page.evaluate(() => {
     const composer = document.querySelector("#chat-composer")!.getBoundingClientRect();
-    const tabs = document.querySelector("#touch-tab-bar")!.getBoundingClientRect();
-    return Math.round(composer.bottom - tabs.top);
+    return Math.round(composer.bottom - window.visualViewport!.height);
   })).toBeLessThanOrEqual(1);
   await expect(page.locator("#chat-composer")).toBeVisible();
   await expect(page.locator("#chat-task-list")).toBeVisible();
@@ -858,7 +858,8 @@ for (const drilldown of [false, true]) {
       await expect(page.locator("html")).not.toHaveAttribute("data-chat-answering", "");
       await expect(page.locator("html")).not.toHaveAttribute("data-chat-editing", "");
       await setVisualViewport(page, { height: 844 });
-      await expect(page.locator("#touch-tab-bar")).toBeVisible();
+      await expect(page.locator("#touch-tab-bar")).toBeHidden();
+      await expect(page.locator("#navigation-handle")).toBeVisible();
       await expect.poll(stillScrollTop(timeline)).toBe(true);
 
       // Originally at the live end: answering is a temporary positioning
@@ -897,7 +898,8 @@ for (const drilldown of [false, true]) {
     await card.locator("[data-question-primary]").tap();
     await expect(card.locator("[data-question-custom-input]")).toHaveCount(0);
     await setVisualViewport(page, { height: 844 });
-    await expect(page.locator("#touch-tab-bar")).toBeVisible();
+    await expect(page.locator("#touch-tab-bar")).toBeHidden();
+    await expect(page.locator("#navigation-handle")).toBeVisible();
     await expect.poll(stillScrollTop(timeline)).toBe(true);
     const heightBeforeAppend = await timeline.evaluate(element => element.scrollHeight);
     await control(request, { action: "item", conversationId: owner, item: {
@@ -1161,7 +1163,7 @@ test("rotation and live mode switching retain Chat without remounting", async ({
   await page.setViewportSize({ width: 844, height: 390 });
   await expect(page.locator("#chat-input")).toHaveValue("rotation draft");
   await page.locator("#chat-input").blur();
-  await page.locator("#touch-tab-files").click();
+  await showSurface(page, "files");
   // A desktop-capable viewport before escaping touch mode: below the 900px
   // stacked breakpoint the chat panel's viewport guard keeps it collapsed,
   // so the split needs iPad-landscape room to present.
@@ -1215,7 +1217,7 @@ test("the touch chooser files both agents' conversations under their days", asyn
   const token = await request.get("/__e2e/terminal-token").then(response => response.json()) as { token: string };
   await page.goto(`/?t=${encodeURIComponent(token.token)}`);
   await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
-  await page.locator("#touch-tab-chat").click();
+  await showSurface(page, "chat");
   const select = page.locator("#chat-conversation-select");
   await expect(select).toHaveValue(today.conversation.id);
   await expect(select.locator("optgroup")).toHaveCount(2);
@@ -1274,7 +1276,7 @@ test("day separators and wrapped slash-command descriptions fit the touch layout
     description: `${"Review the diff for correctness bugs, reuse, simplification, and efficiency cleanups at the chosen effort level. ".repeat(2)}End of review.`,
   }, { name: "overlong-hint", kind: "skill", argumentHint: overlong, description: "One token wider than the menu." }] });
   await page.reload();
-  await page.locator("#touch-tab-chat").click();
+  await showSurface(page, "chat");
   const input = page.locator("#chat-input");
   await input.fill("/code-review-with");
   const menu = page.locator("#chat-command-menu");

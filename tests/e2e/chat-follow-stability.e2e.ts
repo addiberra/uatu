@@ -1,3 +1,4 @@
+import { showSurface } from "./navigation-helpers";
 import { test as baseTest, expect } from "./fixtures";
 import { attachPageDiagnosticsOnFailure, withEngineBrowsers } from "./page-diagnostics";
 import { openChatPanel } from "./chat-helpers";
@@ -283,7 +284,7 @@ for (const browserName of ["chromium", "webkit"] as const) {
           childConversationId: snapshot.conversation.id }] } });
         const { token } = await request.get("/__e2e/terminal-token").then(r => r.json());
         await page.goto(`/?t=${encodeURIComponent(token)}`);
-        if (touch) await page.locator("#touch-tab-chat").click();
+        if (touch) await showSurface(page, "chat");
         else await openChatPanel(page);
         if (child) {
           await page.locator("#chat-compact-workers summary").click();

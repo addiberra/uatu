@@ -3,7 +3,6 @@
 // from `app.ts` so the preview/ feature folder owns this thin renderer.
 
 import { closeMermaidViewer } from "./mermaid-viewer";
-import { escapeHtmlAttribute } from "../shared/html";
 import type { DocumentMeta } from "../shared/types";
 import {
   clearPreviewType,
@@ -12,6 +11,8 @@ import {
   setPreviewBase,
 } from "./header";
 import { hideViewToggle } from "./view-mode";
+import { appUrl } from "../shared/app-url";
+import { contextualAppUrl } from "../shell/watch-context";
 import { documentRevisionKey } from "../shell/document-state";
 import { withImageRevision } from "./image-revision";
 
@@ -23,7 +24,30 @@ if (!previewElementMaybe) {
 
 const previewElement: HTMLElement = previewElementMaybe;
 
-export function renderImagePreview(doc: DocumentMeta): void {
+// Decode off-document, using the indexed root rather than the ambiguous
+// relative static-file fallback. The load owner fences late responses.
+export async function renderImagePreview(doc: DocumentMeta, isCurrent: () => boolean = () => true): Promise<void> {
+  const image = new Image();
+  image.alt = doc.name;
+  const loaded = new Promise<void>((resolve, reject) => {
+    image.onload = () => resolve();
+    image.onerror = () => reject(new Error("image unavailable"));
+  });
+  const src = withImageRevision(contextualAppUrl(appUrl(`/api/document/resource?id=${encodeURIComponent(doc.id)}&rootId=${encodeURIComponent(doc.rootId)}`)), documentRevisionKey(doc.id));
+  image.src = src;
+  try {
+    await loaded;
+  } catch (error) {
+    // Decoding the image off-document keeps a half-loaded frame from flashing,
+    // but it also means a failure would otherwise leave the *previous*
+    // document mounted under this document's identity. Land the destination
+    // explicitly before rethrowing, so every mode shows the failure rather
+    // than silently showing the wrong file. The recovery affordance is
+    // touch-only; desktop at least sees the truthful empty state.
+    if (isCurrent()) renderImageUnavailable(doc);
+    throw error;
+  }
+  if (!isCurrent()) return;
   closeMermaidViewer();
   setPreviewBase(doc.relativePath);
   previewTitleElement.textContent = doc.name;
@@ -31,26 +55,29 @@ export function renderImagePreview(doc: DocumentMeta): void {
   clearPreviewType();
   hideViewToggle();
   previewElement.classList.remove("empty");
-  // The browser resolves `./<name>` via the per-document `<base href>` set by
-  // setPreviewBase, which already points at the document's directory under
-  // the watched root — the same path the static-file fallback knows how to
-  // serve. Encoded for safety against names with spaces / special chars.
-  // encodeURIComponent (not encodeURI) — doc.name is a bare filename with no
-  // path separators to preserve, and we MUST encode `#` and `?` so filenames
-  // like `screenshot#2.png` aren't truncated by the URL parser into a path
-  // ending at `screenshot` plus a `#2.png` fragment.
-  // Carries the file's change revision, the parameter every watched image in
-  // the preview carries (see image-revision.ts), so a changed image gets a URL
-  // the browser has not loaded before.
-  const src = withImageRevision(`./${encodeURIComponent(doc.name)}`, documentRevisionKey(doc.id));
-  // The image already on screen is kept, not rebuilt: its source moves to the
-  // new revision in place, so the old bitmap stays up until the new one has
-  // loaded and the pane neither blanks nor loses its scroll position.
+  // Keep the mounted element and scroll during a same-file refresh. Decode
+  // off-document first, but never let a superseded response replace the bitmap.
   const mounted = previewElement.querySelector<HTMLImageElement>(":scope > .image-preview > img");
-  if (mounted && mounted.dataset.documentId === doc.id) {
-    const next = new URL(src, mounted.baseURI).href;
-    if (mounted.src !== next) mounted.src = next;
+  if (mounted?.dataset.documentId === doc.id) {
+    mounted.src = src;
     return;
   }
-  previewElement.innerHTML = `<div class="image-preview"><img alt="${escapeHtmlAttribute(doc.name)}" data-document-id="${escapeHtmlAttribute(doc.id)}" src="${escapeHtmlAttribute(src)}"></div>`;
+  image.dataset.documentId = doc.id;
+  const container = document.createElement("div");
+  container.className = "image-preview";
+  container.append(image);
+  previewElement.replaceChildren(container);
+}
+
+function renderImageUnavailable(doc: DocumentMeta): void {
+  closeMermaidViewer();
+  setPreviewBase(doc.relativePath);
+  previewTitleElement.textContent = doc.name;
+  previewPathElement.textContent = doc.relativePath;
+  clearPreviewType();
+  hideViewToggle();
+  previewElement.classList.add("empty");
+  previewElement.replaceChildren(
+    Object.assign(document.createElement("p"), { textContent: "This image could not be loaded." }),
+  );
 }

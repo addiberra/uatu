@@ -7,6 +7,7 @@
     <base id="preview-base" href="/" />
     <meta name="theme-color" content="#0a1c38" />
     <link rel="stylesheet" href="./styles.css" />
+    <link rel="stylesheet" href="./shell/navigation-overlay.css" />
     <!-- Pre-paint stamp: restates resolveUiMode (shell/ui-mode.ts) and
          readActiveTabPreference (shell/state.ts) because only a classic
          inline script runs before body parse. Rationale and the equivalence
@@ -1190,7 +1191,18 @@
          bottom edge, safe-area padded; the software keyboard simply covers
          it (platform convention). Hidden entirely in desktop mode via CSS
          keyed on data-ui-mode. -->
-    <nav id="touch-tab-bar" class="touch-tab-bar" role="tablist" aria-label="App surfaces">
+    <button id="navigation-handle" class="navigation-handle" inert type="button" aria-label="Open workspace navigation" aria-controls="touch-tab-bar" aria-expanded="true" aria-describedby="navigation-handle-help"><span aria-hidden="true"><svg viewBox="0 0 16 20"><path d="m6 6 4 4-4 4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span></button>
+    <span id="navigation-handle-help" class="sr-only">Drag to either edge. Arrow keys move the handle; Home resets its position. Press and hold, or use the context-menu key, for navigation preferences.</span>
+    <span id="navigation-chat-attention" class="sr-only">Chat has new activity or needs your response.</span>
+    <nav id="touch-tab-bar" class="touch-tab-bar" inert aria-label="Workspace navigation" data-open="true">
+      <button id="navigation-close" class="navigation-action navigation-close" type="button" aria-label="Close workspace navigation">
+        <svg viewBox="0 0 16 16" width="20" height="20" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" d="M4 4l8 8M12 4l-8 8" /></svg>
+      </button>
+      <a id="navigation-hub" class="navigation-action" hidden>
+        <svg viewBox="0 0 16 16" width="20" height="20" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" d="M2.5 2.5h4.25v4.25H2.5zM9.25 2.5h4.25v4.25H9.25zM2.5 9.25h4.25v4.25H2.5zM9.25 9.25h4.25v4.25H9.25z" /></svg>
+        <span class="touch-tab-label">Hub</span>
+      </a>
+      <div class="navigation-surfaces" role="tablist" aria-label="App surfaces">
       <button
         id="touch-tab-files"
         class="touch-tab"
@@ -1266,7 +1278,22 @@
         <span class="touch-tab-label">Terminal</span>
         <span class="touch-tab-badge" aria-hidden="true"></span>
       </button>
+      </div>
     </nav>
+    <dialog id="navigation-preferences-dialog" class="navigation-preferences-dialog" aria-labelledby="navigation-preferences-title">
+      <div class="navigation-sheet-grabber" aria-hidden="true"></div>
+      <h2 id="navigation-preferences-title">Navigation</h2>
+      <div class="navigation-sheet-body">
+        <p class="navigation-sheet-group">Placement</p>
+        <label>Handle side <select id="navigation-side"><option value="left">Left</option><option value="right">Right</option></select></label>
+        <label>Handle position <input id="navigation-position" type="range" min="0" max="100" step="any"></label>
+        <label>Preview control side <select id="navigation-preview-side"><option value="left">Left</option><option value="right">Right</option></select></label>
+        <label class="navigation-sheet-toggle"><input id="navigation-keep-open" type="checkbox"> Keep Open</label>
+        <p class="navigation-sheet-note">Back to Files stays visible in Preview. Direction arrows hide when the directory contains just one file. Keep Open holds the navigation open until you dismiss it.</p>
+        <p class="navigation-sheet-note">This device only. Previous and Next follow the Files ordering within the current directory; they do not wrap at the ends.</p>
+      </div>
+      <form method="dialog" class="navigation-sheet-actions"><button type="submit">Done</button></form>
+    </dialog>
 
     <div
       id="terminal-confirm"

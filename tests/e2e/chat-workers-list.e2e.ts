@@ -1,3 +1,4 @@
+import { showSurface } from "./navigation-helpers";
 import type { ConversationItem } from "../../src/chat/types";
 import { test as base, expect } from "./fixtures";
 import { withEngineBrowsers } from "./page-diagnostics";
@@ -34,7 +35,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
     };
     const { token } = await request.get("/__e2e/terminal-token").then(response => response.json());
     await page.goto(`/?t=${encodeURIComponent(token)}`);
-    await page.locator("#touch-tab-chat").tap();
+    await showSurface(page, "chat", "tap");
     const track = page.locator("#chat-compact-workers");
     const header = track.locator(":scope > summary");
     await header.tap();
@@ -97,7 +98,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
     })) } }).then(response => response.json());
     const { token } = await request.get("/__e2e/terminal-token").then(response => response.json());
     await page.goto(`/?t=${encodeURIComponent(token)}`);
-    await page.locator("#touch-tab-chat").tap();
+    await showSurface(page, "chat", "tap");
     const track = page.locator("#chat-compact-workers");
     const summary = track.locator(":scope > summary");
     const dismiss = track.getByRole("button", { name: "Dismiss finished", exact: true });
@@ -167,7 +168,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
     ] } }).then(response => response.json());
     const { token } = await request.get("/__e2e/terminal-token").then(response => response.json());
     await page.goto(`/?t=${encodeURIComponent(token)}`);
-    await page.locator("#touch-tab-chat").tap();
+    await showSurface(page, "chat", "tap");
     await page.locator("#chat-conversation-select").selectOption(finished.conversation.id);
     const track = page.locator("#chat-compact-workers");
     const summary = page.locator("#chat-compact-workers-label");
@@ -196,7 +197,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
     ] } }).then(response => response.json());
     const { token } = await request.get("/__e2e/terminal-token").then(response => response.json());
     await page.goto(`/?t=${encodeURIComponent(token)}`);
-    await page.locator("#touch-tab-chat").tap();
+    await showSurface(page, "chat", "tap");
     const mutations: string[] = [];
     page.on("request", request => { if (request.method() === "POST" && /\/(questions|background|cancel|stop)(\/|$)/.test(new URL(request.url()).pathname)) mutations.push(request.url()); });
     const card = page.locator('[data-chat-item-id="question:waiting"]');
@@ -253,7 +254,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
     const snapshot = await request.post("/__e2e/chat", { data: { action: "seed", agent: "claude", title: "Theme implementation", items } }).then(response => response.json());
     const { token } = await request.get("/__e2e/terminal-token").then(response => response.json());
     await page.goto(`/?t=${encodeURIComponent(token)}`);
-    await page.locator("#touch-tab-chat").tap();
+    await showSurface(page, "chat", "tap");
     const track = page.locator("#chat-compact-workers");
     const summary = track.locator(":scope > summary");
     const label = track.locator("#chat-compact-workers-label");
@@ -298,7 +299,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
     await expect(label).toHaveText("2 working");
     await expect(rows).toHaveCount(2);
     await page.reload();
-    await page.locator("#touch-tab-chat").tap();
+    await showSurface(page, "chat", "tap");
     await expect(label).toHaveText("2 working");
     await expect(rows).toHaveCount(2);
     if (await track.getAttribute("open") === null) await summary.tap();

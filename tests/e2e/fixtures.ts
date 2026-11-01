@@ -26,13 +26,15 @@ function gitCeilingFor(workspace: string): string {
 }
 
 type WorkerFixtures = {
+  productionServer: boolean;
   /** The port the worker's dedicated server is listening on. */
   serverPort: number;
 };
 
 export const test = base.extend<{}, WorkerFixtures>({
+  productionServer: [false, { scope: "worker", option: true }],
   serverPort: [
-    async ({}, use, workerInfo) => {
+    async ({ productionServer }, use, workerInfo) => {
       // The port follows the worker's parallel slot (see ports.ts for why
       // not workerIndex). The workspace keeps workerIndex: a replacement
       // worker must not inherit a predecessor's leftover files.
@@ -59,6 +61,7 @@ export const test = base.extend<{}, WorkerFixtures>({
       const child = spawn(binary ?? "bun", binary ? [] : harness, {
         env: {
           ...process.env,
+          ...(productionServer ? { NODE_ENV: "production" } : {}),
           UATU_E2E_PORT: String(port),
           UATU_E2E_WORKSPACE: workspace,
           GIT_CEILING_DIRECTORIES: gitCeilingFor(workspace),

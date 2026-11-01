@@ -1,3 +1,4 @@
+import { showSurface } from "./navigation-helpers";
 import type { APIRequestContext, Page, Route } from "@playwright/test";
 
 import { chooseChatModel, openChatPanel } from "./chat-helpers";
@@ -787,7 +788,7 @@ test.describe("touch composer rail with attachments", () => {
     const token = await request.get("/__e2e/terminal-token").then(r => r.json()) as { token: string };
     await page.goto(`/?t=${encodeURIComponent(token.token)}`);
     await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
-    await page.locator("#touch-tab-chat").click();
+    await showSurface(page, "chat");
     await expect(page.locator("#chat-surface")).toBeVisible();
     await page.getByRole("button", { name: "New conversation" }).click();
     await expect(page.locator("#chat-conversation-select")).not.toHaveValue("");

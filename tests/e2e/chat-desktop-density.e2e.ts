@@ -1,3 +1,4 @@
+import { showSurface } from "./navigation-helpers";
 import { expect, test } from "./fixtures";
 import { openChatPanel, openChatPending, openChatWorkers } from "./chat-helpers";
 
@@ -109,7 +110,7 @@ test("explicit comfortable mode keeps touch targets on a fine-pointer desktop", 
   await request.post("/__e2e/chat", { data: { action: "agents", stack: "opencode-v2" } });
   const { token } = await request.get("/__e2e/terminal-token").then(r => r.json());
   await page.goto(`/?t=${encodeURIComponent(token)}`);
-  await page.locator("#touch-tab-chat").click();
+  await showSurface(page, "chat");
   await page.getByRole("button", { name: "New conversation", exact: true }).click();
   await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
   await expect(page.locator("#chat-state")).toContainText("Started new conversation");

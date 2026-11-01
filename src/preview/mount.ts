@@ -12,6 +12,7 @@ import { closeMermaidViewer } from "./mermaid-viewer";
 import { renderMermaidDiagrams, replaceMermaidCodeBlocks } from "../render/preview";
 import type { FileFacts, RootGroup, ViewMode } from "../shared/types";
 import { appState } from "../shell/state";
+import { onUiModeChange, uiMode } from "../shell/ui-mode";
 import { previewObserverRoot, previewScrollRoot } from "../shell/preview-scroll-root";
 import { renderBinaryUnavailable } from "./binary";
 import { applyDiffForActiveDocument } from "./diff";
@@ -42,8 +43,9 @@ import { refreshOutline } from "./outline";
 import { clearUpdateSignal, syncFileFactsStrip } from "./file-facts-strip";
 import { attachMetadataCardToggleListener, renderMetadataCard } from "./metadata-card";
 import { syncViewToggle } from "./view-mode";
+import { createDocumentLoadGuard, type DocumentLoadToken } from "./load-generation";
+import { currentWatchContext } from "../shell/watch-context";
 import { getSelectedDestination, getSelectionActivation, getSelectionGeneration, setPreviewMode } from "../shell/selection";
-import { createDocumentLoadGuard } from "./load-generation";
 import { documentRevisionKey } from "../shell/document-state";
 import { enrichDocumentFacts, forgetDocumentFacts } from "./facts-enrichment";
 import {
@@ -98,6 +100,16 @@ const previewShellElement: HTMLElement = previewShellElementMaybe;
 // yank them back to the top).
 let lastLoadedDocumentId: string | null = null;
 const documentLoadGuard = createDocumentLoadGuard(getSelectionGeneration, documentRevisionKey);
+export const documentLoadState = documentLoadGuard.state;
+export const onDocumentLoadChange = documentLoadGuard.subscribe;
+// The deadline's recovery UI belongs to touch Preview. If it has already
+// expired, leaving touch must start a fresh owned load rather than hide the
+// only Retry control and permanently discard the still-pending response.
+onUiModeChange(mode => {
+  const load = documentLoadState();
+  if (mode === "desktop" && load.status === "timeout" && load.documentId === appState.selectedId
+    && appState.selectedId && appState.previewMode.kind === "document") void loadDocument(appState.selectedId);
+});
 const documentLoadRetry = createDocumentLoadRetry();
 const alwaysCurrent = () => true;
 
@@ -183,12 +195,14 @@ export async function applyDocumentPayload(
   payload: RenderedDocument,
   isCurrent?: () => boolean,
 ): Promise<void> {
+  let ownedToken: DocumentLoadToken | undefined;
   if (!isCurrent) {
     const loadToken = documentLoadGuard.begin(
       payload.id,
       appState.viewMode,
       appState.viewLayout,
     );
+    ownedToken = loadToken;
     isCurrent = () => documentLoadGuard.isCurrent(
       loadToken,
       appState.selectedId,
@@ -222,6 +236,7 @@ export async function applyDocumentPayload(
   if (!isCurrent()) return;
   syncViewToggle(payload);
   syncLayoutChooser(payload);
+  if (ownedToken) documentLoadGuard.settle(ownedToken, "ready");
   // The previous document's content (and any selection within it) was just
   // replaced. Re-evaluate so the pane reflects the new state instead of a
   // stale capture from the prior document.
@@ -448,7 +463,7 @@ export async function loadDocument(
       same ? onPresented : undefined, same ? trigger : "request");
   })) return;
   await executeLoadDocument(documentId, trigger);
-  if (selectionGeneration === getSelectionGeneration() && appState.selectedId === documentId) onPresented?.();
+  if (selectionGeneration === getSelectionGeneration() && appState.selectedId === documentId && documentLoadState().status === "ready") onPresented?.();
 }
 
 async function executeLoadDocument(documentId: string, trigger: DocumentLoadTrigger) {
@@ -456,12 +471,16 @@ async function executeLoadDocument(documentId: string, trigger: DocumentLoadTrig
   const requestedLayout = appState.viewLayout;
   const loadToken = documentLoadGuard.begin(documentId, requestedView, requestedLayout);
   const activation = getSelectionActivation();
-  const isCurrent = () => documentLoadGuard.isCurrent(
+  const context = JSON.stringify(currentWatchContext());
+  let expired = false;
+  const isCurrent = () => !expired && appState.previewMode.kind !== "commit"
+    && context === JSON.stringify(currentWatchContext()) && documentLoadGuard.isCurrent(
     loadToken,
     appState.selectedId,
     appState.viewMode,
     appState.viewLayout,
   );
+  const run = async () => {
   // A document *switch* (different id than what's currently mounted) resets
   // the preview scroll to the top so the user lands at the beginning of the
   // new doc. An in-place *refresh* (same id, e.g. file-watcher reload of the
@@ -504,6 +523,7 @@ async function executeLoadDocument(documentId: string, trigger: DocumentLoadTrig
   if (!doc) {
     documentLoadRetry.settle();
     renderUnavailableDocument(documentId);
+    documentLoadGuard.settle(loadToken, "missing-target");
     return;
   }
   setPreviewMode({ kind: "document" });
@@ -511,7 +531,7 @@ async function executeLoadDocument(documentId: string, trigger: DocumentLoadTrig
     documentLoadRetry.settle();
     syncFileFactsStrip({ kind: "hidden" });
     if (isViewableImageName(doc.name)) {
-      renderImagePreview(doc);
+      await renderImagePreview(doc, isCurrent);
     } else {
       renderBinaryUnavailable(doc);
     }
@@ -524,7 +544,7 @@ async function executeLoadDocument(documentId: string, trigger: DocumentLoadTrig
   if (appState.viewMode === "diff") {
     documentLoadRetry.settle();
     void learnEmbeddedImages(documentId);
-    await applyDiffForActiveDocument(documentId);
+    await applyDiffForActiveDocument(documentId, isCurrent);
     return;
   }
 
@@ -537,6 +557,7 @@ async function executeLoadDocument(documentId: string, trigger: DocumentLoadTrig
   if (!isCurrent()) return;
   if (!result.ok) {
     const { failure } = result;
+    documentLoadGuard.settle(loadToken, failure.kind === "status" && failure.status === 404 ? "missing-target" : "load-error");
     if (!isTransientDocumentFailure(failure)) {
       // The server stated something about the document (gone, not readable,
       // not viewable), or answered OK with something that is not a document.
@@ -565,6 +586,30 @@ async function executeLoadDocument(documentId: string, trigger: DocumentLoadTrig
   rememberDocumentPayload(payload);
   if (payload.view !== "rendered") void learnEmbeddedImages(documentId);
   await applyDocumentPayload(payload, isCurrent);
+  };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = Promise.withResolvers<never>();
+  const syncDeadline = (mode: "touch" | "desktop") => {
+    clearTimeout(timer);
+    // Desktop keeps its existing unbounded presentation wait. A pending load
+    // entering touch gets its own ten-second recovery budget; leaving touch
+    // cancels it without expiring the load's ownership token.
+    if (mode === "touch") timer = setTimeout(() => deadline.reject(new Error("document timeout")), 10_000);
+  };
+  const stopWatchingMode = onUiModeChange(syncDeadline);
+  syncDeadline(uiMode());
+  try {
+    await Promise.race([run(), deadline.promise]);
+    if (isCurrent() && documentLoadState().status === "pending-selection") documentLoadGuard.settle(loadToken, "ready");
+  } catch (error) {
+    if (isCurrent()) {
+      expired = true;
+      documentLoadGuard.settle(loadToken, error instanceof Error && error.message === "document timeout" ? "timeout" : "load-error");
+    }
+  } finally {
+    clearTimeout(timer);
+    stopWatchingMode();
+  }
 }
 
 // One `/api/document` request, classified (see classifyDocumentResponse).

@@ -1,3 +1,4 @@
+import { showSurface } from "./navigation-helpers";
 import type { Page } from "@playwright/test";
 import { test as baseTest, expect } from "./fixtures";
 import { attachPageDiagnosticsOnFailure, withEngineBrowsers } from "./page-diagnostics";
@@ -250,7 +251,7 @@ for (const engine of ["chromium", "webkit"] as const) {
       await expect(modeToggle).toBeFocused();
       await page.keyboard.press("Enter");
       await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
-      await page.locator("#touch-tab-chat").click();
+      await showSurface(page, "chat");
       await expect(window).toHaveClass(/is-full-area/);
       await expect.poll(() => page.locator("#find-query").evaluate(el => !!el.closest("[inert]"))).toBe(true);
       await window.getByRole("button", { name: "Return to chat" }).focus();
@@ -590,7 +591,7 @@ for (const engine of ["chromium", "webkit"] as const) {
       if (!touch) await drag(page, window.getByRole("group", { name: /^Resize output/ }), 80, 40);
       const geometry = await window.boundingBox(), anchor = await position(viewport);
       const ownerNode = await outputView.elementHandle();
-      if (touch) await page.locator("#touch-tab-files").click();
+      if (touch) await showSurface(page, "files");
       else await page.locator("#chat-collapse").click();
       await expect.soft(page.locator(".chat-shell-window")).toBeHidden({ timeout: 1000 });
       await frames(page);
@@ -604,7 +605,7 @@ for (const engine of ["chromium", "webkit"] as const) {
       await frames(page);
       const hidden = await work(page);
       expect(hidden).toEqual(before);
-      if (touch) await page.locator("#touch-tab-chat").click();
+      if (touch) await showSurface(page, "chat");
       else await page.locator("#chat-expand").click();
       await expect(window).toBeVisible();
       await expect(window).toHaveAttribute("data-shell-item-id", "shell:a");
@@ -820,11 +821,11 @@ for (const engine of ["chromium", "webkit"] as const) {
       // The persistent rail toggle is outside the output work area.
       await page.getByRole("button", { name: "Switch to touch layout" }).click();
       await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
-      await page.locator("#touch-tab-chat").click();
+      await showSurface(page, "chat");
       await expect(window).toHaveClass(/is-full-area/);
       await expectReading(viewport, anchor);
       await window.getByRole("button", { name: "Return to chat" }).click();
-      await page.locator("#touch-tab-files").click();
+      await showSurface(page, "files");
       await page.locator("#ui-mode-toggle").click();
       await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "desktop");
       await outputView.getByRole("button", { name: "Pop out", exact: true }).click();

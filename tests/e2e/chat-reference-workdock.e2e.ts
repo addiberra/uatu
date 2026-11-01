@@ -1,3 +1,4 @@
+import { showSurface } from "./navigation-helpers";
 import { test as base, expect } from "./fixtures";
 import { attachPageDiagnosticsOnFailure, withEngineBrowsers } from "./page-diagnostics";
 import { openChatPanel } from "./chat-helpers";
@@ -27,7 +28,7 @@ for (const engine of ["chromium", "webkit"] as const) for (const touch of [false
       const { token } = await request.get("/__e2e/terminal-token").then(r => r.json());
       await page.goto(`/?t=${encodeURIComponent(token)}`);
       await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
-      if (touch) await page.locator("#touch-tab-chat").click(); else await openChatPanel(page);
+      if (touch) await showSurface(page, "chat"); else await openChatPanel(page);
       await page.getByRole("button", { name: "New conversation", exact: true }).click();
       await expect(page.locator("#chat-conversation-select")).not.toHaveValue("");
       await page.locator("#chat-input").fill("Implement the task model and check layout independently");

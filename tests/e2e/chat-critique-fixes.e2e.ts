@@ -1,3 +1,4 @@
+import { showSurface } from "./navigation-helpers";
 import type { Page, APIRequestContext } from "@playwright/test";
 import { test as base, expect } from "./fixtures";
 import { withEngineBrowsers } from "./page-diagnostics";
@@ -10,7 +11,7 @@ async function boot(page: Page, request: APIRequestContext) {
   await request.post("/__e2e/chat", { data: { action: "agents", stack: "opencode-v2", backgroundPreview: true } });
   const { token } = await request.get("/__e2e/terminal-token").then(r => r.json());
   await page.goto(`/?t=${encodeURIComponent(token)}`);
-  if (await page.locator("html").getAttribute("data-ui-mode") === "touch") await page.locator("#touch-tab-chat").click();
+  if (await page.locator("html").getAttribute("data-ui-mode") === "touch") await showSurface(page, "chat");
   else await openChatPanel(page);
   await page.getByRole("button", { name: "New conversation", exact: true }).click();
   await expect(page.locator("#chat-conversation-select")).not.toHaveValue("");
@@ -116,7 +117,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`critique re
     await request.post("/__e2e/reset"); await request.post("/__e2e/chat", { data: { action: "agents", count: 2 } });
     await request.post("/__e2e/chat", { data: { action: "seed", agent: "claude", title: "Question", items: [{ id: "question:critique", type: "question", requestId: "critique", status: "pending", createdAt: Date.now(), questions: [{ header: "Approach", prompt: "Which approach should be used for the independent task?", multiple: false, allowFreeForm: true, options: [{ label: "Minimal change", description: "Preserve compact density and metadata" }, { label: "Broader audit", description: "Review long content safely" }] }] }] } });
     const { token } = await request.get("/__e2e/terminal-token").then(r => r.json());
-    await page.goto(`/?t=${encodeURIComponent(token)}`); await page.locator("#touch-tab-chat").click();
+    await page.goto(`/?t=${encodeURIComponent(token)}`); await showSurface(page, "chat");
     await page.addStyleTag({ content: "html { font-size:200% !important }" });
     const option = page.locator(".chat-question-option").first();
     await option.locator("input").focus();

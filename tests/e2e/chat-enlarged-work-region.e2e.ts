@@ -1,3 +1,4 @@
+import { showSurface } from "./navigation-helpers";
 import { test, expect } from "./fixtures";
 import { expectWorkControlVisible, expectWorkLayoutReady } from "./work-panel-assertions";
 import { saveEvidence } from "./evidence";
@@ -20,7 +21,7 @@ for (const geometry of [
     const { token } = await request.get("/__e2e/terminal-token").then(r => r.json());
     await page.goto(`/?t=${encodeURIComponent(token)}`);
     await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
-    if (geometry.mode === "touch") await page.locator("#touch-tab-chat").click();
+    if (geometry.mode === "touch") await showSurface(page, "chat");
     await page.getByRole("button", { name: "New conversation", exact: true }).click();
     await expect(page.locator("#chat-conversation-select")).not.toHaveValue("");
     await page.locator("#chat-input").fill("Enlarged region regression");

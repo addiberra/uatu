@@ -5,6 +5,7 @@
 // the HTTP surface, the Settings pane, and the notice the Hub sends running
 // workspaces, which reaches the workspace's chat through its live stream.
 
+import { showSurface } from "./navigation-helpers";
 import type { Browser, Page } from "@playwright/test";
 
 import { openChatConfiguration, openChatPanel } from "./chat-helpers";
@@ -23,7 +24,7 @@ async function phoneChat(browser: Browser, hub: HubE2EInfo, workspace: HubE2EWor
   const page = await context.newPage();
   await signIn(page, hub);
   await page.goto(workspace.sessionUrl);
-  await page.locator("#touch-tab-chat").click();
+  await showSurface(page, "chat");
   await page.locator("#chat-conversation-select").selectOption(conversationId);
   return { page, close: () => context.close() };
 }

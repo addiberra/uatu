@@ -1,3 +1,4 @@
+import { showSurface } from "./navigation-helpers";
 import type { APIRequestContext, Page } from "@playwright/test";
 
 import { openChatPanel } from "./chat-helpers";
@@ -28,7 +29,7 @@ async function bootChat(page: Page, request: APIRequestContext): Promise<void> {
   const token = await request.get("/__e2e/terminal-token").then(response => response.json()) as { token: string };
   await page.goto(`/?t=${encodeURIComponent(token.token)}`);
   await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
-  if (await page.locator("html").getAttribute("data-ui-mode") === "touch") await page.locator("#touch-tab-chat").tap();
+  if (await page.locator("html").getAttribute("data-ui-mode") === "touch") await showSurface(page, "chat", "tap");
   else await openChatPanel(page);
   await expect(page.locator("#chat-state")).not.toContainText("Loading chat");
 }
@@ -694,7 +695,7 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
       expect(await (await accepted).json()).toMatchObject({ pending: true, delivery: key === "Alt+Enter" ? "queue" : "steer" });
     }
     await page.reload();
-    await page.locator("#touch-tab-chat").tap();
+    await showSurface(page, "chat", "tap");
     await expect(page.locator("#chat-stop")).toBeEnabled();
     await input.fill("Reloaded touch steer");
     const accepted = page.waitForResponse(response => response.url().endsWith("/prompts"));
@@ -1182,7 +1183,7 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
     const token = await request.get("/__e2e/terminal-token").then(response => response.json()) as { token: string };
     await page.goto(`/?t=${encodeURIComponent(token.token)}`);
     await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
-    await page.locator("#touch-tab-chat").click();
+    await showSurface(page, "chat");
     await expect(page.locator("#chat-surface")).toBeVisible();
     const conversationId = await newConversation(page);
     const input = page.locator("#chat-input");

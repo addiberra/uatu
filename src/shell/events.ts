@@ -43,6 +43,14 @@ import { setSelectedId, getPendingDocumentPath, getSelectionActivation, getSelec
 import { appState } from "./state";
 import { renderCommitPreview } from "./url";
 import { contextualAppUrl, currentWatchContext, setClientScope } from "./watch-context";
+import { setCorpusStatus } from "./corpus-status";
+
+let corpusGeneration = 0;
+function syncCorpusStatus(): void {
+  corpusGeneration++;
+  setCorpusStatus(appState.discovery.status === "ready" ? "ready"
+    : appState.discovery.status === "error" ? "index-error" : "loading");
+}
 
 // The page's document subscription. Transport recovery belongs to the
 // channel (`shell/live-channel.ts`): it closes each failed stream and reopens
@@ -202,6 +210,7 @@ function applyServerSnapshot(payload: StatePayload): boolean {
   // Title, favicon tint, and sidebar marker all derive from roots;
   // re-applying on every payload keeps them honest if roots change.
   applyProjectIdentity(payload.roots);
+  syncCorpusStatus();
   // An image changed on disk gets a new URL wherever the preview shows it —
   // embedded in the open document or opened as an image itself — even when
   // the document around it did not change and is not reloaded.
@@ -227,8 +236,12 @@ export function adoptBootSnapshot(payload: StatePayload): void {
 export function connectEvents() {
   if (!installed) {
     installed = true;
-    const unsubscribeStatus = liveChannel().onStatus(applyChannelStatus);
-    const unregisterRecovery = registerRecoveryWork(() => stateReconciler.reconcile());
+    const unsubscribeStatus = liveChannel().onStatus(status => {
+      applyChannelStatus(status);
+      if (status === "reconnecting") { corpusGeneration++; setCorpusStatus("index-error"); }
+      else if (status === "live") syncCorpusStatus();
+    });
+    const unregisterRecovery = registerRecoveryWork(reconcileCorpus);
     // Repository data arrives on the document topic. The server observes Git
     // metadata, and for a narrow root its repository's working tree, so the
     // page never polls for it.
@@ -282,6 +295,7 @@ async function applyDocumentPatch(patch: DocumentPatch, generation: number): Pro
   const attributesChanged = [...patch.upserts, ...patch.removals].some(doc => /(^|\/)\.gitattributes$/.test(doc.id));
   if (attributesChanged) forgetAllDiffs();
   appState.discovery = payload.discovery;
+  syncCorpusStatus();
   appState.repositoryFreshness = payload.repositoryState;
   appState.unscopedFingerprint = payload.unscopedFingerprint ?? null;
   refreshPreviewImages(payload.roots);
@@ -561,5 +575,17 @@ const stateReconciler = createStateReconciler<StatePayload>({
 // reconnects the one channel, then runs the reconcile registered above.)
 export async function refreshServerStateForContext(): Promise<void> {
   subscribeDocument();
-  await stateReconciler.reconcile();
+  await reconcileCorpus();
+}
+
+async function reconcileCorpus(): Promise<void> {
+  const generation = ++corpusGeneration;
+  setCorpusStatus("loading");
+  try {
+    await stateReconciler.reconcile();
+    if (generation === corpusGeneration) syncCorpusStatus();
+  } catch (error) {
+    if (generation === corpusGeneration) setCorpusStatus("index-error");
+    throw error;
+  }
 }

@@ -1,3 +1,4 @@
+import { showSurface } from "./navigation-helpers";
 import { test, expect, signIn } from "./hub-fixtures";
 import { chromium, webkit } from "@playwright/test";
 import { captureScreenshot } from "./evidence";
@@ -113,7 +114,7 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`${brow
     const page = await context.newPage();
     await signIn(page, hub);
     await page.goto(`${hub.origin}/s/${hub.workspaces[0].id}/`);
-    await page.getByRole("tab", { name: "Files", exact: true }).tap();
+    await showSurface(page, "files", "tap");
     const toggle = page.locator("#hub-toggle");
     await toggle.tap();
     const settings = page.locator('#hub-menu a[href="/settings#personal-chat-preferences-pane"]');

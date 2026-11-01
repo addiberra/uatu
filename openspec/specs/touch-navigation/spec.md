@@ -14,7 +14,7 @@ The client SHALL resolve a UI mode — `touch` or `desktop` — at boot and stam
 
 #### Scenario: iPad defaults to touch mode
 - **WHEN** the app boots on a coarse-pointer tablet with no stored mode override
-- **THEN** the UI renders in touch mode with the bottom tab bar
+- **THEN** the UI renders in touch mode with workspace navigation initially expanded
 
 #### Scenario: Desktop browsers are untouched
 - **WHEN** the app boots on a fine-pointer device with no stored override
@@ -110,16 +110,38 @@ The active tab SHALL default to `Preview` on first use and SHALL persist per dev
 - **THEN** the app boots into touch mode with the Files tab active
 
 ### Requirement: Touch mode shows a bottom tab bar with four surfaces
-In touch mode the UI SHALL render a bottom tab bar — fixed to the bottom edge, padded by the device's bottom safe-area inset, with `role="tablist"` and `aria-selected` on the active tab — containing exactly four tabs: `Files`, `Preview`, `Chat`, and `Terminal`. Exactly one tab's surface SHALL fill the viewport at a time. The bar SHALL NOT render in desktop mode. The software keyboard MAY cover the bar while an input has focus (the platform convention); the bar reappears when the keyboard dismisses.
+In touch mode the UI SHALL overlay a translucent bottom selector containing a tablist of exactly `Files`, `Preview`, `Chat`, and `Terminal`, with `aria-selected` on the active tab. Exactly one existing surface SHALL fill the viewport without a navigation gutter. A separate Hub action SHALL appear only after a successful Hub probe and SHALL use ordinary full-page navigation to the existing Hub. Standalone and arbitrary-base-path sessions SHALL omit it. Neither selector nor edge handle SHALL render in desktop mode. Surface switching SHALL preserve tree, Chat, and PTY state; Hub navigation SHALL retain existing page departure and restoration semantics, without a resident Return surface.
 
 #### Scenario: One surface at a time
 - **WHEN** the app renders in touch mode
-- **THEN** the tab bar is visible above the home-indicator inset
-- **AND** only the active tab's surface is visible above it
+- **THEN** navigation begins expanded after readiness without moving focus
+- **AND** the active surface fills the viewport behind the overlay
 
 #### Scenario: Tab switching swaps surfaces
 - **WHEN** the user taps the Chat tab, then the Terminal tab, and then the Preview tab
 - **THEN** each tap makes that tab active (`aria-selected`) and its surface fills the viewport
+
+### Requirement: Navigation dismissal protects interaction
+The selector SHALL collapse after seven ready idle seconds, resetting on tab selection. Held pointers, keyboard interaction, and non-pointer focus within navigation SHALL prevent timed dismissal; pointer focus and hover alone SHALL not. Outside content input SHALL dismiss without consuming or duplicating the event. Preview file controls SHALL count as related controls. Hidden navigation SHALL be inert. Close and Escape while navigation owns interaction SHALL restore focus to the handle; dialogs and unrelated surfaces SHALL retain their existing Escape handling. Automatic expansion SHALL not move focus. A client-local Keep Open preference SHALL suppress automatic and outside dismissal, not explicit dismissal.
+
+#### Scenario: A held pointer leaves the selector
+- **WHEN** a pressed pointer moves outside navigation
+- **THEN** timed dismissal remains suspended until release or cancellation
+
+### Requirement: A movable handle restores navigation
+Collapsed navigation SHALL expose a handle with a target of at least 44 by 44 CSS pixels. Dragging SHALL clamp placement to the visible viewport and safe areas, snap to either edge, and never activate navigation. Cancellation SHALL restore committed placement. Arrow keys SHALL move the handle and Home SHALL reset it. Activation SHALL reopen the selector at its bottom position, independently of handle placement.
+
+#### Scenario: Workspace-local preference controls
+- **WHEN** the user holds the collapsed handle or invokes its context-menu key
+- **THEN** workspace controls offer handle side/position, Keep Open, and Preview control side
+- **AND** preferences persist on this device, sharing only navigation preferences across confirmed Hub workspaces, without adding a Hub Settings section
+
+### Requirement: Overlay presentation is accessible and local
+New controls SHALL support keyboard operation, 200% text, device safe areas, visual-viewport changes, meaningful accessible names and existing Chat/Terminal attention signals. Selector bounds SHALL be measured for related overlay clearance. Reveal and dismissal SHALL use interruptible local opacity transitions (approximately 180/280 ms), immediate under Reduced Motion. Reduced Transparency and increased contrast SHALL use opaque readable surfaces. Terminal contrast treatment SHALL affect overlays only.
+
+#### Scenario: Collapsed attention
+- **WHEN** a background surface has pending attention
+- **THEN** the handle indicates it without acknowledging that surface
 
 ### Requirement: Desktop mode respects device safe areas
 Desktop mode on a tablet SHALL retain the desktop arrangement while keeping sidebar controls, preview headings and actions, conversation controls, and the mode toggle inside the device's usable safe area. System status-bar treatments and application blur layers SHALL NOT obscure those controls. The layout SHALL account for top, side, and bottom insets after initial load, rotation, resizing, and live UI mode changes. Physical-device insets SHALL NOT be inferred solely from viewport width or primary pointer type, since attaching a keyboard or trackpad does not remove the device's safe areas.

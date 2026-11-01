@@ -1,5 +1,6 @@
 // Opt-in documentation captures: actual application + synthetic providers.
 // Captures are local Playwright artifacts and report attachments, not repository images.
+import { showSurface } from "./navigation-helpers";
 import { test, expect } from "./fixtures";
 import { openChatPanel, openChatWorkers } from "./chat-helpers";
 import type { Page, APIRequestContext, TestInfo } from "@playwright/test";
@@ -138,7 +139,7 @@ test("mobile side answer minimises without losing the answer", async ({ browser,
     await control(request, { action: "agents", stack: "opencode-v2" });
     const { token } = await request.get("/__e2e/terminal-token").then(r => r.json());
     await page.goto(`/?t=${encodeURIComponent(token)}`);
-    await page.locator("#touch-tab-chat").click();
+    await showSurface(page, "chat");
     await page.getByRole("button", { name: "New conversation", exact: true }).click();
     await expect(page.locator("#chat-state")).toContainText("Started new conversation");
     await page.route("**/aside", route => route.fulfill({ json: { text: "# Review checklist\n\nCheck **keyboard access** and saved task backup before merging.\n\n| Area | Check |\n| --- | --- |\n| Focus | Visible and stable |\n| Backup | Validate before restore |\n\nThe answer stays available from the conversation notice after minimising." } }));

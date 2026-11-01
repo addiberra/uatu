@@ -1,3 +1,4 @@
+import { showSurface } from "./navigation-helpers";
 import type { APIRequestContext, Page } from "@playwright/test";
 import { openChatPanel, openChatWorkers } from "./chat-helpers";
 import { test as base, expect } from "./fixtures";
@@ -28,7 +29,7 @@ for (const engine of ["chromium", "webkit"] as const) test(`large resumed-worker
     const resumed = await control(request, { op: "launchWorker", conversationId, childId: worker.childId });
     await control(request, { op: "appendHistory", conversationId, count: 60 });
     await page.reload();
-    await page.locator("#touch-tab-chat").tap();
+    await showSurface(page, "chat", "tap");
     await expect(page.locator("#chat-items")).toContainText("Historical fixture answer 59");
     await revealTouchWorkers(page);
     await expect(activeTask(page, resumed.taskId)).toBeVisible();
@@ -97,7 +98,7 @@ for (const engine of ["chromium", "webkit"] as const) test(`scrolling parent and
     const worker = await control(request, { op: "launchWorker", conversationId });
     await control(request, { op: "appendHistory", conversationId, count: 60 });
     await page.reload();
-    await page.locator("#touch-tab-chat").tap();
+    await showSurface(page, "chat", "tap");
     await expect(page.locator("#chat-items")).toContainText("Historical fixture answer 59");
     await revealTouchWorkers(page);
     await activeTask(page, worker.taskId).locator("[data-inspect-task]").click();
@@ -190,7 +191,7 @@ async function boot(page: Page, request: APIRequestContext, preview = true) {
   const { token } = await request.get("/__e2e/terminal-token").then(response => response.json());
   await page.goto(`/?t=${encodeURIComponent(token)}`);
   await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
-  if (await page.locator("html").getAttribute("data-ui-mode") === "touch") await page.locator("#touch-tab-chat").tap();
+  if (await page.locator("html").getAttribute("data-ui-mode") === "touch") await showSurface(page, "chat", "tap");
   else await openChatPanel(page);
   await expect(page.locator("#chat-state")).not.toContainText("Loading chat");
   await page.getByRole("button", { name: "New conversation" }).click();

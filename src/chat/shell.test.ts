@@ -34,10 +34,15 @@ describe("chat shell accessibility", () => {
 
   test("exposes exactly four ordered touch tabs with selection semantics", () => {
     const bar = document.querySelector("#touch-tab-bar");
-    expect(bar?.getAttribute("role")).toBe("tablist");
-    const tabs = Array.from(bar?.querySelectorAll('[role="tab"]') ?? []);
+    expect(bar?.getAttribute("aria-label")).toBe("Workspace navigation");
+    const tablist = bar?.querySelector('[role="tablist"]');
+    expect(tablist?.getAttribute("aria-label")).toBe("App surfaces");
+    const tabs = Array.from(tablist?.querySelectorAll('[role="tab"]') ?? []);
     expect(tabs.map(tab => tab.getAttribute("data-tab"))).toEqual(["files", "preview", "chat", "terminal"]);
     expect(tabs.every(tab => tab.hasAttribute("aria-selected"))).toBe(true);
+    expect(tablist?.contains(document.querySelector("#navigation-close"))).toBe(false);
+    expect(tablist?.contains(document.querySelector("#navigation-hub"))).toBe(false);
+    expect(bar?.querySelector("#navigation-close")?.getAttribute("aria-label")).toBe("Close workspace navigation");
   });
 
   test("labels the timeline, composer, chooser, status, and request controls", () => {

@@ -101,12 +101,12 @@ export function cancelDiffPresentation(): void {
   diffLoadingSignal?.settle();
 }
 
-export async function applyDiffForActiveDocument(documentId: string): Promise<void> {
+export async function applyDiffForActiveDocument(documentId: string, ownsLoad?: () => boolean): Promise<void> {
   requestedDiffKeys.set(documentId, currentDiffInputKey(documentId));
   const selectionGeneration = getSelectionGeneration();
   const generation = ++diffLoadGeneration;
   const revision = diffRevisionKey(documentId);
-  const isCurrent = () => generation === diffLoadGeneration
+  const isCurrent = () => (ownsLoad?.() ?? true) && generation === diffLoadGeneration
     && selectionGeneration === getSelectionGeneration()
     && revision === diffRevisionKey(documentId)
     && appState.previewMode.kind === "document"
@@ -127,6 +127,7 @@ export async function applyDiffForActiveDocument(documentId: string): Promise<vo
     let payload = documentDiffCache.get(documentId);
     if (!payload) {
       const fetched = await fetchDocumentDiff(documentId);
+      if (!fetched && isCurrent() && ownsLoad) throw new Error("document diff failed");
       if (!fetched || !isCurrent()) {
         return;
       }

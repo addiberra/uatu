@@ -1,3 +1,4 @@
+import { showSurface } from "./navigation-helpers";
 import type { APIRequestContext, Page, TestInfo } from "@playwright/test";
 
 import { openChatPanel } from "./chat-helpers";
@@ -19,11 +20,11 @@ async function boot(page: Page, request: APIRequestContext): Promise<void> {
   await page.goto(`/?t=${encodeURIComponent(token.token)}`);
   await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
   const mode = await page.locator("html").getAttribute("data-ui-mode");
-  if (mode === "touch") await page.locator("#touch-tab-chat").click();
+  if (mode === "touch") await showSurface(page, "chat");
   else await openChatPanel(page);
   await expect(page.locator("#chat-state")).not.toContainText("Loading chat");
   await expect(page.locator("#chat-conversation-select option")).toHaveCount(3);
-  if (mode === "touch") await page.locator("#touch-tab-preview").click();
+  if (mode === "touch") await showSurface(page, "preview");
 }
 
 async function capture(page: Page, testInfo: TestInfo, name: string): Promise<void> {
@@ -140,7 +141,7 @@ test.describe("touch conversation inventory presentation", () => {
     await expect(page.locator("#touch-tab-chat")).toHaveAttribute("aria-label", "Chat, 1 new conversation");
     await expect(page.locator("#touch-tab-chat .chat-inventory-attention")).toBeVisible();
 
-    await page.locator("#touch-tab-chat").click();
+    await showSurface(page, "chat");
     await expect(page.locator("#chat-surface")).toBeVisible();
     await expect(page.locator("#touch-tab-chat .chat-inventory-attention")).toBeHidden();
     await expect(page.locator("#chat-conversation-unseen-count")).toHaveAttribute("aria-label", "Acknowledge 1 new conversation");
@@ -170,7 +171,7 @@ test.describe("touch conversation inventory presentation", () => {
         left: 0, leftMax: 0,
       },
     });
-    await page.locator("#touch-tab-chat").click();
+    await showSurface(page, "chat");
     await applyChatInventoryFixture(page, { unseenCount: 3, announce: true });
     await page.locator("#chat-conversation-select").focus();
     await expect(page.locator("#chat-surface")).toHaveCSS("padding-top", "47px");

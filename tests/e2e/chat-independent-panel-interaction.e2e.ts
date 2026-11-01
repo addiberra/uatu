@@ -1,3 +1,4 @@
+import { showSurface } from "./navigation-helpers";
 import { test as base, expect } from "./fixtures";
 import { attachPageDiagnosticsOnFailure, withEngineBrowsers } from "./page-diagnostics";
 import { expectWorkControlVisible, expectWorkLayoutReady } from "./work-panel-assertions";
@@ -18,7 +19,7 @@ for (const engine of ["chromium", "webkit"] as const) {
       await page.goto(`/?t=${encodeURIComponent(token)}`);
       await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
       await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
-      await page.locator("#touch-tab-chat").tap();
+      await showSurface(page, "chat", "tap");
       await expect(page.locator("#touch-tab-chat")).toHaveAttribute("aria-selected", "true");
       await page.getByRole("button", { name: "New conversation", exact: true }).tap();
       await expect(page.locator("#chat-conversation-select")).not.toHaveValue("");

@@ -11,6 +11,7 @@ import { appDocumentRelativePath, appUrl } from "../shared/app-url";
 import { carryNotificationTarget } from "../chat/notification-navigation";
 import { findDocumentById, findDocumentByRelativePath } from "./storage";
 import { loadDocument } from "../preview/mount";
+import { measurePreviewHeader } from "../preview/header";
 import { renderEmptyPreview } from "../preview/empty";
 import { renderSidebar } from "../sidebar/shell";
 import { setFollowEnabled, syncFollowToggle } from "./follow";
@@ -44,7 +45,7 @@ export function buildDocumentPath(relativePath: string): string {
 // must not grow the back stack.
 export function pushSelection(documentId: string, relativePath: string) {
   const url = buildDocumentPath(relativePath);
-  if (window.location.pathname === url) {
+  if (window.location.pathname === url && window.history.state?.documentId === documentId) {
     return;
   }
   window.history.pushState({ documentId }, "", carryNotificationTarget(url, window.location.search));
@@ -77,8 +78,8 @@ export function pushCommitPreview(repositoryId: string, sha: string) {
 // subsequent popstate resolution — the initial entry has `state === null`
 // until we set it). The hash is preserved on the boot path so a deep link
 // like `/guides/setup.md#installation` still scrolls to the named heading.
-export function replaceSelection(documentId: string, relativePath: string) {
-  const url = carryNotificationTarget(buildDocumentPath(relativePath) + window.location.hash, window.location.search);
+export function replaceSelection(documentId: string, relativePath: string, hash = window.location.hash) {
+  const url = carryNotificationTarget(buildDocumentPath(relativePath) + hash, window.location.search);
   window.history.replaceState({ documentId }, "", url);
 }
 
@@ -96,6 +97,7 @@ export function scrollToFragment(rawId: string) {
   for (const candidate of candidates) {
     const element = previewElement.querySelector(`[id="${cssEscape(candidate)}"]`);
     if (element instanceof HTMLElement) {
+      measurePreviewHeader();
       element.scrollIntoView({ behavior: "smooth", block: "start" });
       return;
     }
@@ -108,7 +110,8 @@ function cssEscape(value: string): string {
   return value.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
 }
 
-function isSameDocumentHashOnlyNavigation(): boolean {
+function isSameDocumentHashOnlyNavigation(destinationId?: string): boolean {
+  if (destinationId && destinationId !== appState.selectedId) return false;
   if (!appState.selectedId) {
     return false;
   }
@@ -157,7 +160,8 @@ export function attachPopstateHandler() {
     // (e.g. a TOC entry) which pushed a `#fragment` history entry, then hit
     // back. Pathname is unchanged so we MUST NOT reload the document, and we
     // MUST NOT disable follow mode — TOC navigation is not a document switch.
-    if (isSameDocumentHashOnlyNavigation()) {
+    const historyId = typeof event.state?.documentId === "string" ? event.state.documentId as string : undefined;
+    if (isSameDocumentHashOnlyNavigation(historyId)) {
       if (window.location.hash) {
         scrollToFragment(window.location.hash.slice(1));
       } else {
@@ -208,10 +212,11 @@ export function attachPopstateHandler() {
       return;
     }
 
-    const requestedDoc = findDocumentByRelativePath(urlRelativePath);
-    // Documents and previewable images: Back can return to an image Follow
-    // switched to (Rule C) as well as to a document.
-    if (requestedDoc && isFollowableFile(requestedDoc)) {
+    const requestedDoc = historyId ? findDocumentById(historyId) : findDocumentByRelativePath(urlRelativePath);
+    // Resolve recorded identity first; a same-path file in another root is
+    // never a substitute. All indexed kinds use their ordinary renderer.
+    if (requestedDoc && requestedDoc.relativePath === urlRelativePath
+      && (appState.scope.kind === "folder" || requestedDoc.id === appState.scope.documentId)) {
       setSelectedId(requestedDoc.id);
       setPreviewMode({ kind: "document" });
       renderSidebar();

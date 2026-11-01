@@ -1,3 +1,4 @@
+import { showSurface } from "./navigation-helpers";
 import type { APIRequestContext, Page } from "@playwright/test";
 
 import { openChatPanel, openChatPending } from "./chat-helpers";
@@ -14,7 +15,7 @@ async function bootChat(page: Page, request: APIRequestContext): Promise<void> {
   const token = await tokenResponse.json() as { token: string };
   await page.goto(`/?t=${encodeURIComponent(token.token)}`);
   await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
-  if (await page.locator("html").getAttribute("data-ui-mode") === "touch") await page.locator("#touch-tab-chat").click();
+  if (await page.locator("html").getAttribute("data-ui-mode") === "touch") await showSurface(page, "chat");
   else await openChatPanel(page);
   await expect(page.locator("#chat-state")).not.toContainText("Loading chat");
 }
@@ -181,7 +182,7 @@ for (const engine of ["chromium", "webkit"] as const) for (const touch of [false
       await bootChat(page, request);
       await control(request, { action: "agents", count: 2 });
       await page.reload();
-      if (touch) await page.locator("#touch-tab-chat").click();
+      if (touch) await showSurface(page, "chat");
       else await openChatPanel(page);
       await page.getByRole("button", { name: "New conversation", exact: true }).click();
       await page.locator("#chat-agent-menu .chat-agent-menu__item", { hasText: "Claude Code" }).click();

@@ -1,6 +1,7 @@
 // Ten permissions in one turn left a user unable to tell which still needed
 // them. These assert the two things that answer "did I miss one?" — a count
 // that does not scroll away, and a way to reach the one you can act on.
+import { showSurface } from "./navigation-helpers";
 import type { APIRequestContext, Page } from "@playwright/test";
 
 import type { ConversationItem } from "../../src/chat/types";
@@ -209,7 +210,7 @@ test.describe("Allow always asks for confirmation", () => {
   }
   const openTouchChat = async (page: Page, conversationId: string) => {
     await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
-    await page.locator("#touch-tab-chat").click();
+    await showSurface(page, "chat");
     await expect(page.locator("#chat-conversation-select")).toHaveValue(conversationId);
   };
 
@@ -357,7 +358,7 @@ test.describe("an MCP permission shows the call it would allow", () => {
   }
   const openTouchChat = async (page: Page, conversationId: string) => {
     await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
-    await page.locator("#touch-tab-chat").click();
+    await showSurface(page, "chat");
     await expect(page.locator("#chat-conversation-select")).toHaveValue(conversationId);
   };
 

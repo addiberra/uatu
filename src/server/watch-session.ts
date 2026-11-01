@@ -1,5 +1,6 @@
 // Session coordination. File events own the index; Git runs independently.
 import type chokidar from "chokidar";
+import { documentResourceResponse } from "./static-files";
 import { lstat, realpath, stat } from "node:fs/promises";
 import type { Stats } from "node:fs";
 import path from "node:path";
@@ -376,6 +377,15 @@ export function createWatchSession(entries: WatchEntry[], initialFollow: boolean
       return undefined;
     },
     findDocument: find,
+    getDocumentResource(rootId: string, documentId: string, context: WatchContext) {
+      // A stale pin must not normalize into a broader resource request.
+      const scope = entries.length === 1 && entries[0]?.kind === "file"
+        ? { kind: "file" as const, documentId: entries[0].absolutePath } : context.scope;
+      const doc = find(documentId);
+      const root = doc && roots.get(rootId);
+      const indexed = root && doc ? [{ ...root.index.metadata(), docs: [doc] }] : [];
+      return documentResourceResponse(indexed, scope, rootId, documentId, options.respectGitignore ?? DEFAULT_RESPECT_GITIGNORE);
+    },
     getDiscoveryState: discovery,
     documentRevision: (id: string) => `${epoch}:${find(id)?.revision ?? "missing"}`,
     repositoryGeneration: () => repositories.freshness.generation,

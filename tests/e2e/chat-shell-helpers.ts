@@ -1,3 +1,4 @@
+import { showSurface } from "./navigation-helpers";
 import type { APIRequestContext, Locator, Page } from "@playwright/test";
 import type { ActivityStatus, ConversationItem } from "../../src/chat/types";
 import { LIVE_ENVELOPE_EVENT } from "../../src/shared/live-protocol";
@@ -39,7 +40,7 @@ export async function bootShell(page: Page, request: APIRequestContext, options:
   if (status === "running") await control(request, { action: "status", conversationId: id, status: "running" });
   const { token } = await request.get("/__e2e/terminal-token").then(r => r.json());
   await page.goto(`/?t=${encodeURIComponent(token)}`);
-  if (touch) await page.locator("#touch-tab-chat").click();
+  if (touch) await showSurface(page, "chat");
   else await openChatPanel(page);
   await page.locator("#chat-conversation-select").selectOption(parent.conversation.id);
   if (child) {
@@ -161,7 +162,7 @@ export async function openSeeded(page: Page, seededAndToken: string, touch: bool
   await page.goto(`/?t=${encodeURIComponent(token!)}`);
   if (touch) {
     await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
-    await page.locator("#touch-tab-chat").click();
+    await showSurface(page, "chat");
     await expect(page.locator("#chat-surface")).toBeVisible();
   } else {
     await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");

@@ -1,3 +1,4 @@
+import { showSurface } from "./navigation-helpers";
 import type { APIRequestContext, Locator, Page, TestInfo } from "@playwright/test";
 import type { ConversationSnapshot } from "../../src/chat/types";
 import type { OpenCodeV2FakeSessionState } from "./opencode-v2-fake";
@@ -58,7 +59,7 @@ async function boot(page: Page, request: APIRequestContext) {
   const { token } = await request.get("/__e2e/terminal-token").then(response => response.json());
   await page.goto(`/?t=${encodeURIComponent(token)}`);
   await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
-  if (await page.locator("html").getAttribute("data-ui-mode") === "touch") await page.locator("#touch-tab-chat").tap();
+  if (await page.locator("html").getAttribute("data-ui-mode") === "touch") await showSurface(page, "chat", "tap");
   else await openChatPanel(page);
   await expect(page.locator("#chat-state")).not.toContainText("Loading chat");
   await page.getByRole("button", { name: "New conversation", exact: true }).click();
@@ -208,20 +209,20 @@ for (const engine of ["chromium", "webkit"] as const) for (const scene of [
     if (scene.mode === "desktop" && scene.touch) {
       await page.getByRole("button", { name: "Switch to touch layout", exact: true }).tap();
       await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
-      await page.locator("#touch-tab-chat").tap();
+      await showSurface(page, "chat", "tap");
       await expect(workers).not.toHaveAttribute("open"); // desktop auto-open is not a touch choice
       await expect(pending).toHaveAttribute("aria-expanded", "false");
       await header.tap(); await pending.tap();
       await expect(workers).toHaveAttribute("open");
       await expect(pending).toHaveAttribute("aria-expanded", "true");
-      await page.locator("#touch-tab-files").tap();
+      await showSurface(page, "files", "tap");
       await page.getByRole("button", { name: "Switch to desktop layout", exact: true }).tap();
       await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "desktop");
       await expect(workers).toHaveAttribute("open");
       await expect(pending).toHaveAttribute("aria-expanded", "false"); // touch's explicit open stays touch-local
     }
     await page.reload();
-    if (scene.mode === "touch") await page.locator("#touch-tab-chat").tap(); else await openChatPanel(page);
+    if (scene.mode === "touch") await showSurface(page, "chat", "tap"); else await openChatPanel(page);
     await expect(page.locator("#chat-compact-workers-label")).toHaveText("4 finished");
     await expect(workers).not.toHaveAttribute("open"); // hydration of history alone is not new active work
     await expect(pending).toHaveAttribute("aria-expanded", String(scene.mode === "desktop"));

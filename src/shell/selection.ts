@@ -10,7 +10,13 @@ import { persistPersonalWorkspaceState } from "./personal-state";
 import { writeSelectionCleared } from "./selection-storage";
 import { documentIndex } from "./document-state";
 
-let selectedDestination: { id: string; name: string; relativePath: string } | null = null;
+let selectedDestination: { id: string; rootId: string; name: string; relativePath: string } | null = null;
+const listeners = new Set<() => void>();
+export function onSelectionChange(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => { listeners.delete(listener); };
+}
+function notifySelection(): void { for (const listener of listeners) listener(); }
 let selectionGeneration = 0;
 let pendingDocumentPath: string | null = null;
 export function getPendingDocumentPath(): string | null { return pendingDocumentPath; }
@@ -47,6 +53,7 @@ export function clearDocumentSelection(): void {
   appState.selectionCleared = true;
   writeSelectionCleared(true);
   persistPersonalWorkspaceState({ documentPath: null, follow: false });
+  notifySelection();
 }
 
 export function getSelectedDestination() {
@@ -72,15 +79,16 @@ export function setSelectedId(next: string | null, origin: "reconcile" | "naviga
     if (documentIndex.epoch) {
       const document = documentIndex.find(next);
       if (document) {
-        selectedDestination = { id: document.id, name: document.name, relativePath: document.relativePath };
+        selectedDestination = { id: document.id, rootId: document.rootId, name: document.name, relativePath: document.relativePath };
         if (changed || origin === "navigation") persistPersonalWorkspaceState({ documentPath: document.relativePath });
       }
+      notifySelection();
       return;
     }
     for (const root of appState.roots) {
       const document = root.docs.find(candidate => candidate.id === next);
       if (document) {
-        selectedDestination = { id: document.id, name: document.name, relativePath: document.relativePath };
+        selectedDestination = { id: document.id, rootId: root.id, name: document.name, relativePath: document.relativePath };
         // Every watcher frame re-confirms the selection it already holds. That
         // is not this client choosing a document: re-saving it would let an
         // idle client overwrite the document the user last picked elsewhere,
@@ -93,9 +101,12 @@ export function setSelectedId(next: string | null, origin: "reconcile" | "naviga
       }
     }
   }
+  notifySelection();
 }
 
 export function setPreviewMode(next: PreviewMode): void {
+  if (next.kind === "commit") selectionGeneration++;
   if (next.kind === "commit") pendingDocumentPath = null;
   appState.previewMode = next;
+  notifySelection();
 }

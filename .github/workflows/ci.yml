@@ -248,6 +248,11 @@ jobs:
           - name: perf
             id: perf
             args: --project=perf
+          # Exercise the extracted touch controls in both browser engines.
+          # This config uses one worker because its fixtures share workspace paths.
+          - name: touch navigation
+            id: touch-navigation
+            args: --config=playwright.mobile.config.ts --project=mobile-chromium --project=mobile-webkit
 
     steps:
       - name: Check out repository

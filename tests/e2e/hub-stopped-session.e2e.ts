@@ -11,6 +11,7 @@
 // hub API, standing in for the dashboard or another device), and the
 // switcher menu's current row. Each is captured at desktop and phone sizes.
 
+import { showSurface } from "./navigation-helpers";
 import type { BrowserContext, Page, TestInfo } from "@playwright/test";
 
 import { openChatPanel } from "./chat-helpers";
@@ -78,11 +79,11 @@ async function openTab(context: BrowserContext, workspace: HubE2EWorkspace): Pro
 
 async function preview(page: Page, name: string, touch: boolean): Promise<void> {
   if (touch) {
-    await page.locator('#touch-tab-bar [data-tab="files"]').click();
+    await showSurface(page, "files");
   }
   await treeRow(page, name).click();
   if (touch) {
-    await page.locator('#touch-tab-bar [data-tab="preview"]').click();
+    await showSurface(page, "preview");
   }
   await expect(page.locator("#preview-path")).toHaveText(name);
 }
@@ -187,7 +188,7 @@ test.describe("phone", () => {
     await stageWork(page, hub.workspaces[0]!, true);
 
     await stopSession(hub, page, "alpha");
-    await page.locator('#touch-tab-bar [data-tab="files"]').click();
+    await showSurface(page, "files");
     await expectStopped(page);
     await expectNotReloaded(page);
     await shot(page, testInfo, "stopped-session-phone-stopped");
@@ -195,7 +196,7 @@ test.describe("phone", () => {
     await indicator(page).tap();
     await expectRecovered(page);
     await shot(page, testInfo, "stopped-session-phone-recovered");
-    await page.locator('#touch-tab-bar [data-tab="preview"]').click();
+    await showSurface(page, "preview");
     await expectWorkKept(page, true);
     await leaveTidy(page, true);
   });

@@ -11,6 +11,7 @@
 // position — rather than the shell's, because the whole point is which
 // element moved.
 
+import { showSurface } from "./navigation-helpers";
 import { expect, test } from "./fixtures";
 import { waitForPreviewToSettle } from "./fixtures";
 import { openTreeFile, treeRow } from "./tree-helpers";
@@ -80,7 +81,7 @@ async function bootTouch(
 
 // Open the tall document from the Files tab and land back on Preview.
 async function openTallDoc(page: import("@playwright/test").Page): Promise<void> {
-  await page.locator("#touch-tab-files").click();
+  await showSurface(page, "files");
   await openTreeFile(page, "tall-doc.md");
   await expect(page.locator("html")).toHaveAttribute("data-active-tab", "preview");
   await expect(page.locator("#preview-title")).toHaveText("Tall Document");
@@ -237,7 +238,7 @@ test("⌘F from the Files tab brings Preview forward before mounting the bar", a
   // #191: the bar used to mount inside the hidden preview while native find
   // stayed suppressed, so the shortcut did nothing at all.
   await openTallDoc(page);
-  await page.locator("#touch-tab-files").click();
+  await showSurface(page, "files");
   await expect(page.locator("html")).toHaveAttribute("data-active-tab", "files");
 
   await page.keyboard.press(FIND);
@@ -335,7 +336,7 @@ test("switching UI mode mid-session keeps every scroll path working", async ({ p
 
   // Switch to desktop mode WITHOUT reloading. The toggle lives in the sidebar
   // chrome, which in touch mode renders inside the Files tab.
-  await page.locator("#touch-tab-files").click();
+  await showSurface(page, "files");
   await page.locator("#ui-mode-toggle").click();
   await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "desktop");
   await page.evaluate(() => window.scrollTo({ top: 0 }));

@@ -38,9 +38,13 @@ function memoryStorage(): Storage {
   } as Storage;
 }
 
-const GLOBALS = ["document", "window", "Node", "Element", "HTMLElement", "HTMLButtonElement", "Event", "customElements"] as const;
+const GLOBALS = ["document", "window", "Node", "Element", "HTMLElement", "HTMLButtonElement", "Event", "customElements", "MutationObserver"] as const;
 const frames: FrameRequestCallback[] = [];
 const WINDOW_STUBS = {
+  // linkedom has no layout/resize delivery. This focus test runs the real
+  // navigation owner; browser suites separately exercise measured placement.
+  ResizeObserver: class { observe() {} unobserve() {} disconnect() {} },
+  getComputedStyle: () => ({ paddingTop: "0px", paddingRight: "0px", paddingBottom: "0px", paddingLeft: "0px" }),
   requestAnimationFrame: (callback: FrameRequestCallback) => { frames.push(callback); return frames.length; },
   cancelAnimationFrame: () => {},
   // A coarse primary pointer resolves the UI mode to touch.
@@ -112,6 +116,13 @@ beforeAll(async () => {
   }
   for (const [name, stub] of Object.entries(WINDOW_STUBS)) Reflect.set(window, name, stub);
   for (const name of GLOBALS) Reflect.set(globalThis, name, name === "window" ? window : Reflect.get(window, name));
+
+  // linkedom exposes select.value as getter-only. Supply the browser's
+  // writable value contract for the preference controls initialized by the
+  // real overlay; preference behavior itself is covered in browser tests.
+  for (const select of document.querySelectorAll<HTMLSelectElement>("#navigation-side, #navigation-preview-side")) {
+    Object.defineProperty(select, "value", { configurable: true, writable: true, value: select.querySelector("option")?.value });
+  }
 
   // linkedom tracks no focus: give it an activeElement that focus() moves.
   let active: Element | null = null;

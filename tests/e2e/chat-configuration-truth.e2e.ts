@@ -1,3 +1,4 @@
+import { showSurface } from "./navigation-helpers";
 import type { APIRequestContext, Page } from "@playwright/test";
 
 import { openChatConfiguration, openChatPanel } from "./chat-helpers";
@@ -37,7 +38,7 @@ for (const engine of ["chromium", "webkit"] as const) for (const mode of ["deskt
       const { token } = await request.get("/__e2e/terminal-token").then(response => response.json());
       await page.goto(`/?t=${encodeURIComponent(token)}`);
       await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
-      if (mode === "touch") await page.locator("#touch-tab-chat").tap();
+      if (mode === "touch") await showSurface(page, "chat", "tap");
       else await openChatPanel(page);
       await page.getByRole("button", { name: "New conversation", exact: true }).click();
       await expect(page.locator("#chat-state")).toContainText("Started new conversation with OpenCode");

@@ -1,3 +1,4 @@
+import { showSurface } from "./navigation-helpers";
 import type { APIRequestContext, Page } from "@playwright/test";
 import { expect, test as baseTest } from "./fixtures";
 import { attachPageDiagnosticsOnFailure, withEngineBrowsers } from "./page-diagnostics";
@@ -132,13 +133,13 @@ for (const engine of ["chromium", "webkit"] as const) {
       await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
       expect(await page.locator("html").evaluate(element => element.style.getPropertyValue("--desktop-visual-height"))).toBe("");
       await expect(page.locator(".app-shell")).toHaveCSS("padding-top", "0px");
-      await page.locator("#touch-tab-chat").click();
+      await showSurface(page, "chat");
       await expect(page.locator("#chat-input")).toHaveValue("Keep this iPad draft");
       await viewport(page, { height: 650, offsetTop: 30 });
       await expect(page.locator("#chat-surface")).toHaveCSS("--chat-visual-height", "650px");
       await page.setViewportSize(LANDSCAPE);
       await viewport(page, { ...LANDSCAPE, offsetTop: 0 });
-      await page.locator("#touch-tab-files").click();
+      await showSurface(page, "files");
       await page.locator("#ui-mode-toggle").click();
       await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "desktop");
       await expect(page.locator(".app-shell")).toHaveCSS("position", "fixed");

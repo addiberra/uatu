@@ -11,6 +11,7 @@
 // is touch mode, where the switcher lives in the Files tab.
 
 
+import { showSurface } from "./navigation-helpers";
 import { QUIET_BEFORE_NOTICE_MS } from "../../src/shell/attention-notice";
 import { openChatPanel } from "./chat-helpers";
 import { evidencePath, recordEvidence } from "./evidence";
@@ -313,7 +314,7 @@ test.describe("phone", () => {
     const staged = await stageActivity(hub, hubContext);
     const page = await openSessionTab(hubContext, hub.workspaces[0]!);
     await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
-    await page.locator("#touch-tab-files").click();
+    await showSurface(page, "files");
     await expect(page.locator("#touch-tab-files")).toHaveAttribute("aria-selected", "true");
 
     await expectStaged(page);
@@ -484,7 +485,7 @@ test.describe("in-app notice for questions elsewhere", () => {
       await childChatControl(hub.workspaces[0]!, { action: "seed", title: "Working here", items: [{ id: "u1", type: "user_message", createdAt: 1, text: "Refactor the parser." }] });
       const page = await openSessionTab(hubContext, hub.workspaces[0]!);
       await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
-      await page.locator("#touch-tab-files").click();
+      await showSurface(page, "files");
       await settled(page);
       const question = await ask(hub, "beta", "Needs an answer on the phone", "permission:notice-touch");
       try {
@@ -494,7 +495,7 @@ test.describe("in-app notice for questions elsewhere", () => {
         expect(box.y + box.height).toBeLessThanOrEqual(bar.y);
         await shot(page, testInfo, "after-notice-phone-files");
         // Every tab stays reachable with the notice up.
-        await page.locator("#touch-tab-chat").click();
+        await showSurface(page, "chat");
         await expect(page.locator("#touch-tab-chat")).toHaveAttribute("aria-selected", "true");
         await expect(page.locator("#chat-input")).toBeVisible();
         const top = (await notice(page, "beta").boundingBox())!;

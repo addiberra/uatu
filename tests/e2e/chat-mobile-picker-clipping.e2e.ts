@@ -1,3 +1,4 @@
+import { showSurface } from "./navigation-helpers";
 import type { APIRequestContext, Page } from "@playwright/test";
 import type { ChatModel } from "../../src/chat/types";
 import { expect, test as base } from "./fixtures";
@@ -21,7 +22,7 @@ async function bootPicker(page: Page, request: APIRequestContext, count: number)
   await page.goto(`/?t=${encodeURIComponent(token)}`);
   await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
   await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
-  await page.locator("#touch-tab-chat").tap();
+  await showSurface(page, "chat", "tap");
   await expect(page.locator("#chat-state")).not.toContainText("Loading chat");
   await expect(page.locator("#chat-configuration-trigger")).toContainText("Model 1");
 }

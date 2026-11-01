@@ -89,6 +89,7 @@ let terminalCloseHold: { released: Promise<void>; release: () => void } | null =
 let terminalClosesHeld = 0;
 
 let activeFilePath: string | null = null;
+let activeRootPaths: string[] | null = null;
 let activeRespectGitignore = true;
 let activeFollow = true;
 let discoveryGate: ReturnType<typeof Promise.withResolvers<void>> | null = null;
@@ -303,6 +304,7 @@ const terminalServer = terminalEnabled
 async function handleE2EReset(request: Request): Promise<Response> {
   let body: {
     file?: string;
+    roots?: string[];
     extras?: Record<string, string>;
     dirty?: Record<string, string>;
     git?: boolean;
@@ -369,6 +371,7 @@ async function handleE2EReset(request: Request): Promise<Response> {
 
   await watchSession.stop();
   activeFilePath = typeof body.file === "string" ? body.file : null;
+  activeRootPaths = Array.isArray(body.roots) ? body.roots.filter((root: unknown): root is string => typeof root === "string") : null;
   activeRespectGitignore =
     typeof body.respectGitignore === "boolean" ? body.respectGitignore : true;
   activeFollow = typeof body.follow === "boolean" ? body.follow : true;
@@ -941,7 +944,7 @@ async function createSession(options: { resetWorkspace: boolean }) {
   }
   const entryPaths = activeFilePath
     ? [`${activeWorkspaceRoot}/${activeFilePath}`]
-    : [activeWorkspaceRoot];
+    : activeRootPaths?.map(root => path.join(activeWorkspaceRoot, root)) ?? [activeWorkspaceRoot];
   const entries = await resolveWatchRoots(entryPaths, process.cwd());
   activeEntries = entries;
   const heldDiscovery = discoveryGate;

@@ -1,3 +1,4 @@
+import { openNavigation } from "./navigation-helpers";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { writeFile, realpath } from "node:fs/promises";
@@ -33,6 +34,7 @@ async function ready(page: Page) {
 async function surface(page: Page, name: "Files" | "Preview" | "Terminal" | "Chat") {
   await ready(page);
   if (await page.locator("html").getAttribute("data-ui-mode") === "touch") {
+    await openNavigation(page);
     await page.getByRole("tab", { name, exact: true }).click();
   } else if (name === "Chat" && await page.locator("#chat-expand").isVisible()) {
     await page.locator("#chat-expand").click();

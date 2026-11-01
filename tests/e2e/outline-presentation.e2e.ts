@@ -12,6 +12,7 @@
 // would pass in both presentations and prove nothing, which is the failure mode
 // this repo has already hit twice in other suites.
 
+import { showSurface } from "./navigation-helpers";
 import fs from "node:fs/promises";
 
 import { expect, test } from "./fixtures";
@@ -70,7 +71,7 @@ async function boot(page: Page, request: Request): Promise<void> {
 }
 
 async function openFixtureDoc(page: Page): Promise<void> {
-  await page.locator("#touch-tab-files").click();
+  await showSurface(page, "files");
   await openTreeFile(page, "outline-doc.md");
   await expect(page.locator("html")).toHaveAttribute("data-active-tab", "preview");
   await expect(page.locator("#preview-title")).toHaveText("Outline Fixture");
@@ -227,7 +228,7 @@ test.describe("phone width resolves to the sheet", () => {
     // module's own open state, which `setOpen` writes. The tab-scoped CSS can
     // hide the panel, but it cannot touch this attribute — so a pass here means
     // the dismissal ran, not that something merely became invisible.
-    await page.locator("#touch-tab-files").click();
+    await showSurface(page, "files");
     await openTreeFile(page, "outline-two.md");
     await expect(page.locator("html")).toHaveAttribute("data-active-tab", "preview");
     await expect(page.locator("#preview-title")).toHaveText("Second Fixture");
@@ -563,7 +564,7 @@ test.describe("crossing the threshold", () => {
     await expectPresentation(page, "rail");
 
     // Follow on, from the Files surface that owns the chip.
-    await page.locator("#touch-tab-files").click();
+    await showSurface(page, "files");
     const follow = page.locator("#follow-toggle");
     if ((await follow.getAttribute("aria-pressed")) !== "true") {
       await follow.click();
@@ -582,7 +583,7 @@ test.describe("crossing the threshold", () => {
     );
     await expect(page.locator("html")).toHaveAttribute("data-active-tab", "files");
 
-    await page.locator("#touch-tab-preview").click();
+    await showSurface(page, "preview");
     await expect(page.locator("#preview-title")).toHaveText("Second Fixture");
 
     // Phone width means a sheet, and the document changed — so it must not be

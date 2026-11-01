@@ -6,6 +6,7 @@
 // changes what the user sees ends by capturing a screenshot as evidence
 // (see evidence.ts), so review reads the shots instead of running a session.
 
+import { showSurface } from "./navigation-helpers";
 import type { APIRequestContext, Page } from "@playwright/test";
 
 import { withMoreModels } from "../../src/chat/claude/models";
@@ -107,7 +108,7 @@ async function bootClaude(page: Page, request: APIRequestContext, title: string,
     // The same conversation on the phone chrome, where the chat is a tab and
     // the drill-down takes the whole surface.
     await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
-    await page.locator("#touch-tab-chat").click();
+    await showSurface(page, "chat");
     await expect(page.locator("#chat-surface")).toBeVisible();
   } else {
     await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
@@ -1365,7 +1366,7 @@ for (const touch of [false, true]) {
       await expect(page.locator('[data-chat-item-id="window:live"]')).toHaveCount(0);
       await capture(page, testInfo, "context-limit-confirmed-during-turn");
       await page.reload();
-      if (touch) await page.locator("#touch-tab-chat").click();
+      if (touch) await showSurface(page, "chat");
       else await openChatPanel(page);
       await expect(label).toHaveText("21%");
       await expect(page.locator("#chat-context-usage")).toHaveAttribute("data-window-source", "session");
@@ -1393,7 +1394,7 @@ test.describe("Claude Code plan readout at phone width", () => {
     const token = await request.get("/__e2e/terminal-token").then(response => response.json()) as { token: string };
     await page.goto(`/?t=${encodeURIComponent(token.token)}`);
     await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
-    await page.locator("#touch-tab-chat").click();
+    await showSurface(page, "chat");
     await expect(page.locator("#chat-surface")).toBeVisible();
     await page.locator("#chat-conversation-select").selectOption(seeded.conversation.id);
     const summary = page.locator("#chat-plan-usage-summary");
@@ -1411,7 +1412,7 @@ test.describe("Claude Code plan readout at phone width", () => {
 
     // A live switch to the desktop layout puts the sidebar beside the chat
     // and the still-open readout gains its pin; switching back retires it.
-    await page.locator("#touch-tab-files").click();
+    await showSurface(page, "files");
     await page.setViewportSize({ width: 1280, height: 800 });
     await page.locator("#ui-mode-toggle").click();
     await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "desktop");
@@ -1576,7 +1577,7 @@ test.describe("Claude Code scheduled wakeups at phone width", () => {
     const token = await request.get("/__e2e/terminal-token").then(response => response.json()) as { token: string };
     await page.goto(`/?t=${encodeURIComponent(token.token)}`);
     await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
-    await page.locator("#touch-tab-chat").click();
+    await showSurface(page, "chat");
     await expect(page.locator("#chat-surface")).toBeVisible();
     await page.locator("#chat-conversation-select").selectOption(id);
     await control(request, { action: "status", conversationId: id, status: "scheduled" });

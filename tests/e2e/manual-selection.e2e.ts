@@ -2,6 +2,7 @@ import type { Page } from "@playwright/test";
 import type { StatePayload } from "../../src/shared/types";
 import type { DocumentPatch, DocumentSnapshot, DocumentUpdate } from "../../src/shared/document-updates";
 import { expect, test, showGitLogPane } from "./fixtures";
+import { showSurface } from "./navigation-helpers";
 import { openTreeFile, revealTreeRow, treeRow, waitForTreeIdle } from "./tree-helpers";
 
 // Drive real shell/tree reducers with complete, ordered snapshots. File reads
@@ -211,7 +212,7 @@ function responseDelivered(page: Page, urlPart: string, idSuffix?: string) {
     && (idSuffix === undefined || new URL(request.url()).searchParams.get("id")?.endsWith(idSuffix) === true));
 }
 async function files(page: Page, touch: boolean) {
-  if (touch) await page.locator("#touch-tab-files").click();
+  if (touch) await showSurface(page, "files");
 }
 // Expand or collapse a directory row, and prove the click landed on it.
 // The tree is virtualized and keys its row buttons by position in the

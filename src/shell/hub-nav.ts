@@ -27,6 +27,8 @@
 // appUrl() like any other session URL.
 
 import { CHAT_SURFACE_ACTIVE_EVENT, chatSurfaceInView } from "../chat/surface-visibility";
+import { confirmNavigationHubScope } from "./navigation-preferences";
+
 import { appBasePath, appUrl, workspaceIdFromBasePath } from "../shared/app-url";
 import type { WorkspaceActivity } from "../shared/live-protocol";
 import { AttentionNotices, renderAttentionNotices } from "./attention-notice";
@@ -34,6 +36,14 @@ import { awaitConfirmedLive, holdManualReload, liveChannel } from "./live";
 import { setCurrentSessionRunning } from "./session-running";
 import { openWorktreeFork, workspaceIsCheckout, worktreeForkIcon, worktreeProvenanceLabel } from "./worktree-dialog";
 import { watchWorktreeInventory, WORKTREES_CHANGED_EVENT } from "./worktree-live";
+
+let hubAvailable = false;
+const availabilityListeners = new Set<(available: boolean) => void>();
+export function isHubAvailable(): boolean { return hubAvailable; }
+export function onHubAvailabilityChange(listener: (available: boolean) => void): () => void {
+  availabilityListeners.add(listener);
+  return () => { availabilityListeners.delete(listener); };
+}
 
 export type HubWorkspaceSummary = {
   id: string;
@@ -1086,6 +1096,10 @@ export function initHubNav(): void {
       return;
     }
     latest = state.workspaces;
+    // A successful Hub probe, not a base-path guess, authorizes the Hub action.
+    hubAvailable = true;
+    confirmNavigationHubScope();
+    for (const listener of availabilityListeners) listener(true);
     applyListedRunning(state.workspaces);
     worktreeApi = state.worktreeApi;
     updateChip();

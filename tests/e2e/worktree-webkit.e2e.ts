@@ -11,6 +11,7 @@
 // this one journey lives in its own file. WebKit is already installed by
 // `bun run e2e:install`.
 
+import { showSurface } from "./navigation-helpers";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { Page } from "@playwright/test";
@@ -37,7 +38,7 @@ async function git(cwd: string, args: string[]): Promise<string> {
 async function fork(page: Page, parentId: string, mode: string): Promise<void> {
   await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
   if (await page.locator("html").getAttribute("data-ui-mode") === "touch") {
-    await page.getByRole("tab", { name: "Files", exact: true }).click();
+    await showSurface(page, "files");
   }
   await openHubMenu(page);
   await page.getByRole("button", { name: `Add worktree to ${parentId}`, exact: true }).click();
@@ -111,7 +112,7 @@ test.describe("worktree dialog on an iOS-shaped WebKit", () => {
 
     await page.reload();
     await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
-    await page.getByRole("tab", { name: "Files", exact: true }).tap();
+    await showSurface(page, "files", "tap");
     await openHubMenu(page, { tap: true });
     const menu = page.locator("#hub-menu");
     const viewport = page.viewportSize()!;

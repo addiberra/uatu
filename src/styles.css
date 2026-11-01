@@ -8800,16 +8800,6 @@ html[data-ui-mode="touch"] .chat-configuration-model {
   min-height: 3rem;
 }
 
-html[data-ui-mode="touch"][data-chat-keyboard] .touch-tab-bar {
-  display: none;
-}
-
-html[data-ui-mode="touch"][data-chat-input-focused] .touch-tab-bar,
-html[data-ui-mode="touch"][data-chat-editing] .touch-tab-bar,
-html[data-ui-mode="touch"]:has(#chat-input:focus) .touch-tab-bar {
-  display: none;
-}
-
 @media (max-width: 420px) {
   .touch-tab-label { font-size: 0.58rem; }
   .chat-conversation-controls { flex: 1; justify-content: flex-end; min-width: 0; }
@@ -10603,7 +10593,7 @@ html[data-ui-mode="touch"] .chat-surface[data-chat-rail] .chat-timeline {
 html[data-ui-mode="touch"] .attention-notices {
   left: calc(0.75rem + env(safe-area-inset-left));
   right: calc(0.75rem + env(safe-area-inset-right));
-  bottom: calc(var(--tab-bar-total) + 0.75rem);
+  bottom: calc(max(var(--navigation-occluded, 0px), env(safe-area-inset-bottom)) + 0.75rem);
   width: auto;
 }
 

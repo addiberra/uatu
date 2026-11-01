@@ -24,7 +24,9 @@ import { initFindShortcuts, registerProjectSearch } from "./find/shortcut";
 import { initSearchPane, openSearchPane } from "./sidebar/search-pane";
 import { initUiMode } from "./shell/ui-mode";
 import { initDesktopViewport } from "./shell/desktop-viewport";
-import { initTabBar } from "./shell/tab-bar";
+import { initTabBar, navigationWorkspaceReady } from "./shell/tab-bar";
+import { initPreviewFileNavigation } from "./preview/file-navigation";
+import { initPreviewHeaderMeasurement } from "./preview/header";
 import { initChatPanel } from "./chat/surface";
 import { initChat } from "./chat/ui";
 
@@ -98,6 +100,8 @@ initUiMode();
 initDesktopViewport();
 initTabBar();
 initChatPanel();
+initPreviewFileNavigation();
+initPreviewHeaderMeasurement();
 
 initActiveSurfaceTracking();
 initFindBar();
@@ -136,6 +140,7 @@ if (isHubPage()) mountNotifications({
 attachPopstateHandler();
 
 void loadInitialState(() => {
+  navigationWorkspaceReady();
   void waitForWorkspaceCredential().then(() => initChat());
 }).then(() => {
   // Prewarm the diff renderer at idle once we know whether this is a

@@ -1,3 +1,4 @@
+import { showSurface } from "./navigation-helpers";
 import type { APIRequestContext, Page } from "@playwright/test";
 
 import type { ConversationConfiguration, ConversationItem } from "../../src/chat/types";
@@ -738,7 +739,7 @@ test.describe("the working line at phone width", () => {
     const token = await request.get("/__e2e/terminal-token").then(response => response.json()) as { token: string };
     await page.goto(`/?t=${encodeURIComponent(token.token)}`);
     await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
-    await page.locator("#touch-tab-chat").click();
+    await showSurface(page, "chat");
     await expect(page.locator("#chat-conversation-select")).toHaveValue(id);
 
     await control(request, { action: "status", conversationId: id, status: "running" });

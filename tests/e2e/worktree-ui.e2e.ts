@@ -12,6 +12,7 @@
 // recreated, and live invalidation that leaves the page's own selection
 // alone.
 
+import { showSurface } from "./navigation-helpers";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdir, rm, writeFile } from "node:fs/promises";
@@ -39,7 +40,7 @@ async function ready(page: Page): Promise<void> {
 async function files(page: Page): Promise<void> {
   await ready(page);
   if (await page.locator("html").getAttribute("data-ui-mode") === "touch") {
-    await page.getByRole("tab", { name: "Files", exact: true }).click();
+    await showSurface(page, "files");
   }
 }
 

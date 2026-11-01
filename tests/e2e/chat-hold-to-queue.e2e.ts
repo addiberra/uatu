@@ -1,3 +1,4 @@
+import { showSurface } from "./navigation-helpers";
 import type { APIRequestContext, Page } from "@playwright/test";
 import { expect, test as base } from "./fixtures";
 import { withEngineBrowsers } from "./page-diagnostics";
@@ -80,7 +81,7 @@ for (const coarse of [false, true]) test(`side reader minimises on live UI mode 
     await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
     await expect(reader).toBeHidden();
     expect(await reader.evaluate(node => node.matches(":modal"))).toBe(false);
-    await page.locator("#touch-tab-chat").click();
+    await showSurface(page, "chat");
     await input.click();
     await input.fill("Preserved draft after mode switch");
     await expect(input).toBeFocused();
@@ -242,7 +243,7 @@ for (const mode of ["desktop", "touch"] as const) test(`side-reader workspace li
     const reader = page.locator("#chat-aside-dialog");
     const answer = page.locator("#chat-aside-answer");
     const reopen = async () => {
-      if (mode === "touch" && await page.locator("html").getAttribute("data-active-tab") !== "chat") await page.locator("#touch-tab-chat").click();
+      if (mode === "touch" && await page.locator("html").getAttribute("data-active-tab") !== "chat") await showSurface(page, "chat");
       const notice = page.locator("#chat-aside-ready");
       await expect.poll(() => notice.evaluate(node => {
         const box = node.getBoundingClientRect();
@@ -474,7 +475,7 @@ async function boot(page: Page, request: APIRequestContext, start = true, native
   expect(agents.status()).toBe(200);
   const { token } = await request.get("/__e2e/terminal-token").then(response => response.json());
   await page.goto(`/?t=${encodeURIComponent(token)}`);
-  if (await page.locator("html").getAttribute("data-ui-mode") === "touch") await page.locator("#touch-tab-chat").click();
+  if (await page.locator("html").getAttribute("data-ui-mode") === "touch") await showSurface(page, "chat");
   else await openChatPanel(page);
   await page.getByRole("button", { name: "New conversation", exact: true }).click();
   await expect(page.locator("#chat-conversation-select")).not.toHaveValue("");
@@ -751,7 +752,7 @@ test("native Chromium touch hold keeps capture across repaints and queues exactl
     await request.post("/__e2e/chat", { data: { action: "agents", stack: "opencode-v2", backgroundPreview: true } });
     const { token } = await request.get("/__e2e/terminal-token").then(response => response.json());
     await page.goto(`/?t=${encodeURIComponent(token)}`);
-    await page.locator("#touch-tab-chat").tap();
+    await showSurface(page, "chat", "tap");
     await page.getByRole("button", { name: "New conversation", exact: true }).tap();
     await expect(page.locator("#chat-state")).toContainText("Started new conversation with OpenCode.");
     await page.locator("#chat-input").fill("Start native touch work");
