@@ -110,9 +110,13 @@ unaffected.
    this rule does not authorize incomplete history.
 4. **Preserve independent authority.** An unchanged interval is necessary, not
    sufficient: keep complete owned history, unique execution intervals, native
-   identity and replay assertions. Fabricate no result ID, summary or report
-   timestamp. Explicit parent reports, activity recovery and revoked Stop controls
-   keep their existing rules.
+    identity and replay assertions. Fabricate no result ID, summary or report
+    timestamp. Explicit parent reports, activity recovery and revoked Stop controls
+    keep their existing rules.
+    Native-only terminal inference also needs existing execution identity through
+    which the adapter can revoke it. Created/completed clocks without a proven
+    execution ID or alias remain Unresolved; do not invent a `ran` timestamp or
+    broaden matching across executions to preserve completion.
 5. **Withhold stale dismissal proof too.** The Unresolved fallback must not inherit
    dismissibility from the discarded inference. Current `workerDismissalEvidence`
    allows running/Unavailable and running/Ended rows to be dismissible; changing
@@ -121,8 +125,11 @@ unaffected.
    verified evidence.
    The user separately approved optional `outcomeWithheld` on the closed public
    worker row, workspace API revision 38 and strict-client migration guidance.
-   True denies dismissal; actual fresh terminal evidence can clear it. This does
-   not change Hub authentication, saved-dismissal format or Stop authority.
+    True denies dismissal; actual fresh terminal evidence can clear it. This does
+    not change Hub authentication, saved-dismissal format or Stop authority.
+    Apply the inference projection before computing latest-page live membership,
+    so an off-page launcher whose outcome is withheld remains visible as Unresolved.
+    Older cursor pages retain their existing membership rule.
 6. **Replace, do not layer.** After approval remove the outcome-specific request
    chronology/owner routing, overlap exceptions, provisional stage transitions
    and source-specific report/visibility counterproof that this rule replaces.

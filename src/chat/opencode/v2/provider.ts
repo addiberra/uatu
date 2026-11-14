@@ -410,7 +410,9 @@ export class OpenCodeV2Provider implements ChatProvider {
     const page = visible.slice(start, end);
     const reversible = reversibleContext(complete, info);
     signal.throwIfAborted();
-    const liveLaunches = new Set([...normalized.values()].flatMap(({ item }) => item.type === "background_task" && item.status === "running"
+    const projected = [...normalized.values()].map(entry => ({ ...entry, item: entry.item.type === "background_task"
+      ? this.projectInferredOutcome(sourceRead.source, entry.item) : entry.item }));
+    const liveLaunches = new Set(projected.flatMap(({ item }) => item.type === "background_task" && item.status === "running"
       ? [...(item.toolUseIds ?? []), ...(item.toolUseId ? [item.toolUseId] : [])].map(id => `tool:${id}`) : []));
     const accounting: StoredMessageAccounting[] = [];
     let newestPrompt: string | undefined;
@@ -424,11 +426,11 @@ export class OpenCodeV2Provider implements ChatProvider {
     sourceRead.capture();
     completeRead = true;
     return {
-      items: [...normalized.values()].filter(({ item, index }) => index >= start && index < end
-        || options.cursor === undefined && (item.type === "background_task" && item.status === "running" || liveLaunches.has(item.id))).map(({ item }) => item.type === "background_task" ? this.projectInferredOutcome(sourceRead.source, item) : item),
+      items: projected.filter(({ item, index }) => index >= start && index < end
+        || options.cursor === undefined && (item.type === "background_task" && item.status === "running" || liveLaunches.has(item.id))).map(({ item }) => item),
       accounting,
       ...(typeof info?.cost === "number" && Number.isFinite(info.cost) && info.cost >= 0 ? { sessionCostUsd: info.cost } : {}),
-      completeItems: [...normalized.values()].map(({ item }) => item.type === "background_task" ? this.projectInferredOutcome(sourceRead.source, item) : item),
+      completeItems: projected.map(({ item }) => item),
       isWorkerSourceCurrent: workerSource.isCurrent,
       workerSource,
       hiddenWorkerResultIds: complete.slice(visible.length).flatMap(message => message.type === "synthetic" && prepareStoredMessage(message).notification?.status ? [messageIdentity(message)] : []),
@@ -1534,13 +1536,16 @@ export class OpenCodeV2Provider implements ChatProvider {
   private projectInferredOutcome(source: HistoryWorkerSource, item: import("../../types").BackgroundTaskItem, leaseLive = true): import("../../types").BackgroundTaskItem {
     if (!source.inferred.has(item.id) || item.resultId || item.status === "running") return item;
     const child = item.childConversationId;
-    if (leaseLive && source.counters.get(source.parent)?.unchanged() && child
+    // A history-only outcome must remain replaceable by its exact execution.
+    // Sparse launch clocks cannot manufacture that identity (notably `ran`).
+    const revocable = !!(item.activity?.executionId || item.activity?.executionAliases?.length);
+    if (leaseLive && revocable && source.counters.get(source.parent)?.unchanged() && child
       && !source.historyParentChanges.has(child) && source.counters.get(child)?.unchanged()) return item;
     const independentlyActive = item.activity?.kind === "working" || item.activity?.kind === "needs-answer";
     const { endedAt: _end, request: _request, ...activity } = item.activity ?? { kind: "unavailable" as const };
     return { ...item, status: "running", stateUncertain: true, outcomeWithheld: true,
       activity: independentlyActive ? item.activity : { ...activity, kind: "unavailable" },
-      control: { available: false, reason: "Native observations changed during outcome recovery" } };
+      control: { available: false, reason: revocable ? "Native observations changed during outcome recovery" : "Native inference lacks revocable execution identity" } };
   }
 
   private workerResultFallbacks(message: StoredMessage): WorkerResultFallback[] {
