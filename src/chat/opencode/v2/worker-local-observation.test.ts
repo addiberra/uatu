@@ -188,9 +188,10 @@ for (const outcome of ["success", "failure", "explicit"] as const)
 for (const seam of ["provider", "adapter"] as const)
 test(`local ${operation} acknowledgement before record or SSE (${outcome}/${seam})`, async () => {
   const directory = process.cwd(), fake = startOpenCodeV2Fake({ directory });
+  const captured = gate();
   const admission = gate(), admit = gate(), recordEntered = gate(), recordRelease = gate();
   let parent: string | undefined, child: string | undefined, holdAdmission = false, holdRecord = false, rejectMutation = false;
-  let acknowledgements = 0, parentReads = 0;
+  let acknowledgements = 0, parentReads = 0, childEnriched = false;
   const transport = (async (input: Request | string | URL, init?: RequestInit) => {
     const request = new Request(input, init), route = new URL(request.url).pathname;
     if (route === "/api/event") return new Response(new ReadableStream<Uint8Array>({ start(controller) {
@@ -198,7 +199,10 @@ test(`local ${operation} acknowledgement before record or SSE (${outcome}/${seam
       request.signal.addEventListener("abort", () => controller.close(), { once: true });
     } }), { headers: { "content-type": "text/event-stream" } });
     if (route.endsWith("/inbox")) return Response.json({ data: [] });
-    if (holdAdmission && row && (route === "/api/form" || route === "/api/permission/request")) {
+    // Exercise a late initial question response: it must not be mistaken for
+    // final admission while attribution still needs a child record.
+    if (route === "/api/form" && !row) await captured.promise;
+    if (holdAdmission && childEnriched && (route === "/api/form" || route === "/api/permission/request")) {
       admission.release(); await admit.promise;
     }
     if (holdRecord && route === `/api/session/${child}`) { recordEntered.release(); await recordRelease.promise; }
@@ -226,9 +230,11 @@ test(`local ${operation} acknowledgement before record or SSE (${outcome}/${seam
   let row: BackgroundTaskItem | undefined, guard: WorkerSourceGuard | undefined;
   provider.listMessages = async (id, options) => {
     const page = await nativeHistory(id, options);
+    if (id === child) childEnriched = true;
     if (id === parent) {
       row = page.items.find((item): item is BackgroundTaskItem => item.type === "background_task");
       guard = page.workerSource!.retain(owner.signal);
+      captured.release();
     }
     return page;
   };
@@ -242,6 +248,7 @@ test(`local ${operation} acknowledgement before record or SSE (${outcome}/${seam
     holdAdmission = true;
     reading = adapter.history(parent); void reading.catch(() => undefined);
     await Promise.race([admission.promise, reading.then(() => { throw new Error("History completed before the native admission barrier"); })]);
+    const enrichedAtAdmission = childEnriched;
     expect(row).toMatchObject({ status: "completed" });
     expect(workerDismissalEvidence(row)?.dismissible).toBe(true);
     rejectMutation = outcome === "failure";
@@ -261,6 +268,7 @@ test(`local ${operation} acknowledgement before record or SSE (${outcome}/${seam
     }
     admit.release();
     const snapshot = await reading;
+    expect(enrichedAtAdmission).toBe(true);
     const published = snapshot.items.find((item): item is BackgroundTaskItem => item.type === "background_task" && item.taskId === worker.taskId);
     expect(parentReads).toBe(1); // Connected history reuse avoids a second physical parent read.
     if (outcome === "success") withheld(published);
@@ -287,7 +295,7 @@ test(`local ${operation} acknowledgement before record or SSE (${outcome}/${seam
     }
     expect(fake.state().unhandled).toEqual([]);
   } finally {
-    admit.release(); recordRelease.release(); owner.abort();
+    captured.release(); admit.release(); recordRelease.release(); owner.abort();
     await reading?.catch(() => undefined); await followup?.catch(() => undefined); await adapter.dispose(); await fake.stop();
   }
 }, 10_000);
