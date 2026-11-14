@@ -2,6 +2,7 @@ import { test as baseTest, expect } from "./fixtures";
 import { withEngineBrowsers, attachPageDiagnosticsOnFailure } from "./page-diagnostics";
 import { openChatPanel } from "./chat-helpers";
 import { control, position, settleScroll } from "./chat-shell-helpers";
+import { saveEvidence } from "./evidence";
 
 const test = withEngineBrowsers(baseTest);
 attachPageDiagnosticsOnFailure(test);
@@ -125,8 +126,8 @@ for (const engine of ["chromium", "webkit"] as const) {
       await settleScroll(timeline);
       expect(await drift()).toBeLessThanOrEqual(2);
       expect((await position(timeline)).bottom).toBeGreaterThan(300);
-      await info.attach("new-conversation-follow-geometry", { contentType: "application/json",
-        body: JSON.stringify({ reading, firstReply, grownReply, restored: await position(timeline), drift: await drift() }) });
+      await saveEvidence(info, `${engine}-new-conversation-follow-geometry.json`,
+        JSON.stringify({ reading, firstReply, grownReply, restored: await position(timeline), drift: await drift() }));
     } finally {
       await browser.close();
     }

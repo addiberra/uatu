@@ -3121,10 +3121,10 @@ export function initChat(api = new ChatApiClient()): void {
     }
   }
 
-  const selectConversation = async (id: string, deferredStartup = false): Promise<boolean> => {
-    // New records its selected identity before this call for inventory reconciliation.
-    // Capture the displayed view instead, falling back to pending selection intent.
-    const outgoingId = hasSelectedConversation ? projection?.conversationId ?? presentation.selectedId : undefined;
+  const selectConversation = async (id: string, deferredStartup = false, outgoingSelectionId: string | undefined = presentation.selectedId): Promise<boolean> => {
+    // The displayed view owns departure. New supplies the prior selection when
+    // it publishes its incoming identity before a pending snapshot has loaded.
+    const outgoingId = hasSelectedConversation ? projection?.conversationId ?? outgoingSelectionId : undefined;
     const openingStartup = deferredStartup || isUnestablishedStartup(id);
     supersedeStartupSelection();
     hasSelectedConversation = true;
@@ -3540,10 +3540,11 @@ export function initChat(api = new ChatApiClient()): void {
       if (inventoryTracker.noteLocalCreation(snapshot.conversation.id)) syncInventoryAwareness();
       void inventoryReconciler.supersede();
       conversations = dedupeConversationInventory([snapshot.conversation, ...conversations]);
+      const outgoingSelectionId = presentation.selectedId;
       presentation.selectedId = snapshot.conversation.id;
       selectedConversationDeleted = false;
       patchChooser(snapshot.conversation.id);
-      if (await selectConversation(snapshot.conversation.id)) {
+      if (await selectConversation(snapshot.conversation.id, undefined, outgoingSelectionId)) {
         input.focus();
         announce(newConversationAnnouncement(projection?.configuration ?? snapshot.configuration));
       }

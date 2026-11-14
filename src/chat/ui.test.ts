@@ -1901,7 +1901,7 @@ describe("chat reversible-history composer", () => {
     }
   });
 
-  for (const paused of [false, true]) for (const entry of ["New button", "chooser", "pending chooser pause"] as const) test(`new conversation first reply ownership: ${entry} from ${paused ? "paused" : "following"} A`, async () => {
+  for (const paused of [false, true]) for (const entry of ["New button", "chooser", "pending chooser pause", "New while A snapshot pending"] as const) test(`new conversation first reply ownership: ${entry} from ${paused ? "paused" : "following"} A`, async () => {
     const { document, window } = parseHTML(html);
     installDomGlobals(document, window);
     document.documentElement.setAttribute("data-ui-mode", "desktop");
@@ -1947,10 +1947,19 @@ describe("chat reversible-history composer", () => {
     const prompts: Array<{ conversationId: string; requestId: string; text: string }> = [];
     const streams = new Map<string, Parameters<ChatApiClient["stream"]>[2]>();
     const heldB = deferred<ConversationSnapshot>();
+    const heldA = deferred<ConversationSnapshot>();
     const api = questionApi(document, { capabilities: [], items: () => [] });
-    api.conversations = async () => (entry !== "New button" || created ? ["one", "two"] : ["one"]).map(conversation);
-    api.snapshot = async id => id === "one" ? aSnapshot(++aReads > 1)
-      : ++bReads === 1 && entry === "pending chooser pause" ? heldB.promise : snapshot("two");
+    api.conversations = async () => (entry === "New while A snapshot pending"
+      ? created ? ["one", "away", "two"] : ["one", "away"]
+      : entry !== "New button" || created ? ["one", "two"] : ["one"]).map(conversation);
+    api.snapshot = async id => {
+      if (id === "one") {
+        aReads++;
+        return aReads === 2 && entry === "New while A snapshot pending" ? heldA.promise : aSnapshot(aReads > 1);
+      }
+      if (id === "away") return snapshot("away");
+      return ++bReads === 1 && entry === "pending chooser pause" ? heldB.promise : snapshot("two");
+    };
     api.createConversation = async agentId => { creations.push(agentId); created = true; return snapshot("two"); };
     api.prompt = async (conversationId, requestId, text) => {
       prompts.push({ conversationId, requestId, text });
@@ -1981,7 +1990,17 @@ describe("chat reversible-history composer", () => {
         timeline.scrollTop = 650; timeline.dispatchEvent(new window.Event("scroll"));
         expect(container.querySelector<HTMLElement>('[data-chat-item-id="message:a-reading"]')!.getBoundingClientRect().top).toBe(-50);
       }
-      if (entry === "New button") document.querySelector<HTMLButtonElement>("#chat-new-conversation")!.click();
+      if (entry === "New while A snapshot pending") {
+        choose("away");
+        await waitUntil(() => { drain(); return streams.has("away") && !aBefore() && !input.disabled; });
+        choose("one");
+        await waitUntil(() => aReads === 2); drain();
+        expect(container.querySelector("[data-chat-item-id]")).toBeNull();
+        const newButton = document.querySelector<HTMLButtonElement>("#chat-new-conversation")!;
+        expect(newButton.disabled).toBe(false);
+        expect(newButton.hidden).toBe(false);
+        newButton.click();
+      } else if (entry === "New button") document.querySelector<HTMLButtonElement>("#chat-new-conversation")!.click();
       else choose("two");
       if (entry === "pending chooser pause") {
         await waitUntil(() => bReads === 1); drain();
@@ -1993,7 +2012,7 @@ describe("chat reversible-history composer", () => {
         choose("two");
       }
       await waitUntil(() => { drain(); return select.value === "two" && !!streams.get("two") && !aBefore() && !input.disabled; });
-      expect(creations).toHaveLength(entry === "New button" ? 1 : 0);
+      expect(creations).toHaveLength(entry === "New button" || entry === "New while A snapshot pending" ? 1 : 0);
       expect(bReads).toBe(entry === "pending chooser pause" ? 2 : 1);
       expect(timeline.scrollTop).toBe(0);
       submit(document.querySelector<HTMLFormElement>("#chat-composer")!, input, "First B prompt");
@@ -2007,6 +2026,13 @@ describe("chat reversible-history composer", () => {
         item: { ...reply, markdown: "Growing reply" } }, "growing-b-reply");
       await waitUntil(() => { drain(); return bReply()?.textContent?.includes("Growing reply") === true; });
       const grownReplyTop = timeline.scrollTop;
+      if (entry === "New while A snapshot pending") {
+        // Resolve the superseded A read only after B is selected and streaming.
+        // Its DOM and placement must remain B's, even before fixing following.
+        heldA.resolve(aSnapshot(true)); await flush(); drain();
+        expect({ aVisible: !!aBefore(), bVisible: !!bReply(), top: timeline.scrollTop })
+          .toEqual({ aVisible: false, bVisible: true, top: grownReplyTop });
+      }
       choose("one");
       await waitUntil(() => { drain(); return aBefore()?.textContent?.includes("Expanded earlier A") === true && !input.disabled; });
       const restoredATop = timeline.scrollTop;
@@ -2022,6 +2048,7 @@ describe("chat reversible-history composer", () => {
       });
     } finally {
       heldB.resolve(snapshot("two"));
+      heldA.resolve(aSnapshot(true));
       window.dispatchEvent(new window.Event("pagehide"));
       globalThis.requestAnimationFrame = requestFrame;
       globalThis.cancelAnimationFrame = cancelFrame;
