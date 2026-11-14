@@ -117,6 +117,11 @@ unaffected.
     which the adapter can revoke it. Created/completed clocks without a proven
     execution ID or alias remain Unresolved; do not invent a `ran` timestamp or
     broaden matching across executions to preserve completion.
+    A newer activity-only patch is not a new terminal report: if both covered
+    history sources withdraw the same report-free execution, discard its inherited
+    terminal status even across a projection change fence, preserving that newer
+    row's independent activity/control evidence. Explicit reports and different
+    execution identities retain their protections.
 5. **Withhold stale dismissal proof too.** The Unresolved fallback must not inherit
    dismissibility from the discarded inference. Current `workerDismissalEvidence`
    allows running/Unavailable and running/Ended rows to be dismissible; changing

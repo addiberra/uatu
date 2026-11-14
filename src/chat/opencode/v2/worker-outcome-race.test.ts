@@ -2124,9 +2124,16 @@ test(`cached ownership preserves staged warm child qualification (${change})`, a
 
 for (const read of ["history", "automatic-recovery"] as const)
 for (const proof of ["native-ended", "session-active", "session-active-changed", "session-active-report", "same-execution", "parent-report", "changed-identity", "smaller-alias", "smaller-alias-unavailable"] as const)
-test(`${read} resumes active work after withdrawing an inferred outcome (${proof})`, async () => {
+for (const ordering of read === "history" && proof === "native-ended" ? ["ordinary", "late-native-end"] as const : ["ordinary"] as const)
+test(`${read} resumes active work after withdrawing an inferred outcome (${proof})${ordering === "late-native-end" ? " across a native activity publication" : ""}`, async () => {
   const directory = process.cwd(), fake = startOpenCodeV2Fake({ directory });
+  const crossing = ordering === "late-native-end";
+  let endSeen = false, flushHeld = false, releaseFlush!: () => void, flushDone!: () => void, flushEntered!: () => void;
+  const flushGate = new Promise<void>(resolve => { releaseFlush = resolve; });
+  const flushSettled = new Promise<void>(resolve => { flushDone = resolve; });
+  const flushPending = new Promise<void>(resolve => { flushEntered = resolve; });
   let parent: string | undefined, child: string | undefined, resumed = false, armed = false;
+  let withdrawalEvent: Promise<import("../../types").BackgroundTaskItem> | undefined;
   let aliasAttempt = 0;
   const aliasChange = proof === "smaller-alias" || proof === "smaller-alias-unavailable";
   const sessionActive = proof.startsWith("session-active"), explicitReport = proof === "parent-report" || proof === "session-active-report";
@@ -2150,6 +2157,11 @@ test(`${read} resumes active work after withdrawing an inferred outcome (${proof
     if (route === "/api/session/active") return Response.json({ data: resumed && proof !== "native-ended" && proof !== "smaller-alias-unavailable" && child ? { [child]: { status: "running" } } : {} });
     if (proof === "native-ended" && route === "/api/session" && request.method === "GET") return Response.json({ data: [], cursor: {} });
     if (route.endsWith("/inbox")) return Response.json({ data: [] });
+    if (crossing && armed && (route === "/api/permission/request" || route === "/api/form")) {
+      // Admit the native activity patch after the covered history/recovery
+      // sources returned, but before history can publish its withdrawal.
+      releaseFlush(); await flushSettled;
+    }
     const response = await fetch(request);
     if (route === `/api/session/${parent}/message`) {
       const body = await response.json(), first = body.data[0], changed = resumed && (proof === "changed-identity" || proof === "session-active-changed");
@@ -2170,9 +2182,23 @@ test(`${read} resumes active work after withdrawing an inferred outcome (${proof
   const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory, fetch: transport });
   const nativeRecovery = provider.reconcileBackgroundTasks!.bind(provider);
   const nativeEvents = provider.events.bind(provider);
+  if (crossing) {
+    const list = provider.listMessages.bind(provider);
+    provider.listMessages = async (id, options) => {
+      const page = await list(id, options);
+      if (armed && id === parent) expect(page.items.find(item => item.type === "background_task")).toMatchObject({ status: "running", activity: { kind: "unavailable" } });
+      return page;
+    };
+  }
   let endedApplied!: () => void;
   const nativeCheckpoint = () => new Promise<void>(resolve => { endedApplied = resolve; frame("diagnostic.ended-applied", {}); });
-  provider.events = async function* (signal) { for await (const event of nativeEvents(signal)) { yield event; if (event.eventType === "diagnostic.ended-applied") endedApplied(); } };
+  provider.events = async function* (signal) { for await (const event of nativeEvents(signal)) {
+    if (event.eventType === "session.execution.succeeded" && event.conversationId === parent) {
+      endSeen = true;
+      if (crossing) expect(event.updates.find(update => update.kind === "upsert" && update.item.type === "background_task")).toMatchObject({ kind: "upsert", item: { status: "running", activity: { kind: "ended", endedAt: 20 } } });
+    }
+    yield event; if (event.eventType === "diagnostic.ended-applied") endedApplied();
+  } };
   provider.reconcileBackgroundTasks = (id, options) => nativeRecovery(id, options?.onSource ? { ...options, onSource: source => options.onSource!({ ...source, workerSource: {
     isCurrent: source.workerSource.isCurrent,
     retain: signal => {
@@ -2180,7 +2206,23 @@ test(`${read} resumes active work after withdrawing an inferred outcome (${proof
       return source.workerSource.retain(signal);
     },
   } }) } : options);
-  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 }), abort = new AbortController();
+  if (crossing) {
+    const reconcile = provider.reconcileBackgroundTasks;
+    provider.reconcileBackgroundTasks = async (id, options) => {
+      const tasks = await reconcile(id, options);
+      if (armed && id === parent) expect(tasks[0]).toMatchObject({ status: "running", activity: { kind: "ended", endedAt: 20 } });
+      return tasks;
+    };
+  }
+  const taskScheduler: import("../../task-scheduler").ChatTaskScheduler | undefined = crossing ? {
+    async run(name, work) {
+      const held = endSeen && !flushHeld && name === `coalescer.flush:${parent}`;
+      if (held) { flushHeld = true; flushEntered(); await flushGate; }
+      try { return await work(); } finally { if (held) flushDone(); }
+    },
+    setTimeout: (_name, work, ms) => setTimeout(work, ms), clearTimeout: timer => { if (timer != null) clearTimeout(timer); },
+  } : undefined;
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0, taskScheduler }), abort = new AbortController();
   try {
     parent = (await provider.createSession("Resumed history-only outcome")).id;
     const worker = fake.launchRequestWorker(parent); child = worker.childId;
@@ -2220,6 +2262,17 @@ test(`${read} resumes active work after withdrawing an inferred outcome (${proof
     expect(fresh[0]?.activity?.executionId === original).toBe(proof !== "changed-identity" && proof !== "session-active-changed" && !aliasChange);
     if (proof === "native-ended") { expect(nativeGuards.length).toBeGreaterThan(0); expect(nativeGuards.every(guard => guard.isCurrent())).toBe(true); expect(fresh[0]?.resultId).toBeUndefined(); }
     if (proof === "same-execution") expect(fresh[0]?.control?.available).toBe(false);
+    if (crossing) {
+      await flushPending;
+      const subscription = await adapter.subscribe(parent, { signal: abort.signal });
+      expect(subscription.snapshot.items.find(item => item.type === "background_task" && item.taskId === worker.taskId)).toMatchObject({ status: "completed" });
+      withdrawalEvent = (async () => {
+        for await (const event of subscription.events) if (event.type === "item.upsert" && event.item.type === "background_task"
+          && event.item.taskId === worker.taskId && event.item.status === "running") return event.item;
+        throw new Error("No covered worker withdrawal was published");
+      })();
+      void withdrawalEvent.catch(() => undefined);
+    }
     armed = true;
     let items: import("../../types").ConversationItem[];
     if (read === "history") items = (await adapter.history(parent)).items;
@@ -2230,6 +2283,9 @@ test(`${read} resumes active work after withdrawing an inferred outcome (${proof
     }
     const current = items.find((item): item is import("../../types").BackgroundTaskItem => item.type === "background_task" && item.taskId === worker.taskId);
     expect(current?.status).toBe(proof === "native-ended" || proof === "same-execution" || proof === "session-active" || aliasChange ? "running" : "completed");
+    // Assert the awaited history result first: waiting for an eventual Running
+    // event must not conceal a history read that incorrectly returned Completed.
+    if (crossing) expect(await withdrawalEvent).toEqual(current!);
     if (proof === "native-ended") {
       expect(current?.activity).toMatchObject({ kind: "ended", executionId: original });
       expect(current?.activity?.endedAt).toBe(fresh[0]?.activity?.endedAt);
@@ -2238,6 +2294,7 @@ test(`${read} resumes active work after withdrawing an inferred outcome (${proof
       expect((await adapter.workerEvidence(parent)).entries).toContainEqual(expect.objectContaining({ executionId: original, active: false, dismissible: true }));
     }
     expect(workerExecutionClockRuns(current!)).toBe(proof === "same-execution" || proof === "smaller-alias");
+    if (crossing) expect((await adapter.subscribe(parent, { signal: abort.signal })).snapshot.items.find(item => item.id === current?.id)).toEqual(current!);
     if (aliasChange) { expect(current?.activity?.executionAliases).toContain(original); expect(workerCanStop(current!)).toBe(false); }
     if (proof === "same-execution") { expect(current?.activity?.kind).toBe("working"); expect(adapter.activity().working).toBe(true); }
     if (explicitReport) expect(current).toMatchObject({ resultId: "parent-result", summary: "Explicit parent report" });
@@ -2245,7 +2302,7 @@ test(`${read} resumes active work after withdrawing an inferred outcome (${proof
       expect(current?.activity?.kind).toBe("session-active"); expect(workerDismissalEvidence(current)?.dismissible).toBe(false);
       expect(workerCanStop(current!)).toBe(false); expect(current?.resultId).toBeUndefined(); expect(current?.terminalReportedAt).toBeUndefined();
     }
-  } finally { armed = false; abort.abort(); await adapter.dispose(); await fake.stop(); }
+  } finally { releaseFlush(); armed = false; abort.abort(); await adapter.dispose(); await fake.stop(); }
 }, 10_000);
 
 for (const boundary of ["ownership", "initial-parent"] as const)

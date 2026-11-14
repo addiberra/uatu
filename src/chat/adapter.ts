@@ -1845,10 +1845,27 @@ export class ChatAdapter {
     // A newer native row can replace its correlated history copy in the
     // change fence. Reapply only the read-owned native-ID correlation, keeping
     // that row's newer contents even after its old cache/projection departed.
-    if (coverage) items.splice(0, items.length, ...coverage.merge(items).filter(item => {
-      const removal = historyRemovals.get(item.id);
-      return !removal || projection.get(item.id) !== removal.expected;
-    }).map(item => this.correlateSteerMessage(id, item, coverage.steerCorrelations)));
+    if (coverage) {
+      // A live activity patch can retain an old inferred terminal status and
+      // mark the row changed while this read waits for interactions. Keep the
+      // newer row, but not that inherited outcome, when both covered sources
+      // withdraw it for the exact same report-free execution.
+      const withdrawals = new Map(items.flatMap(item => item.type === "background_task" && item.status === "running" && coverage.changed(item.id)
+        && replacesHistoryOnlyOutcome(projection.get(item.id), page.workerSource && page.completeItems?.find(source => source.id === item.id))
+        ? [[item.id, item] as const] : []));
+      items.splice(0, items.length, ...coverage.merge(items).filter(item => {
+        const removal = historyRemovals.get(item.id);
+        return !removal || projection.get(item.id) !== removal.expected;
+      }).map(item => {
+        const withdrawal = withdrawals.get(item.id);
+        if (withdrawal && item.type === "background_task" && replacesHistoryOnlyOutcome(item, withdrawal)) {
+          revokedRows.add(item.id);
+          item = { ...item, status: "running", stateUncertain: item.stateUncertain || withdrawal.stateUncertain,
+            ...(withdrawal.outcomeWithheld ? { outcomeWithheld: true } : {}) };
+        }
+        return this.correlateSteerMessage(id, item, coverage.steerCorrelations);
+      }));
+    }
     reconcileQuestionFreshness?.();
     // The live-task snapshot above was taken before several awaits; a task
     // that settled in the projection meanwhile keeps its settled row.
@@ -1860,7 +1877,7 @@ export class ChatAdapter {
       // Retained completion is not a parent report, and sparse upsert merging
       // must not restore it after the provider withholds that exact inference.
       const source = page.workerSource && page.completeItems?.find(candidate => candidate.id === item.id);
-      if (coverage && !coverage.changed(item.id) && replacesHistoryOnlyOutcome(current, source)) {
+      if (coverage && replacesHistoryOnlyOutcome(current, source)) {
         revokedRows.add(item.id);
         continue;
       }
