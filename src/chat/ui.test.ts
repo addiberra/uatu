@@ -1901,6 +1901,135 @@ describe("chat reversible-history composer", () => {
     }
   });
 
+  for (const paused of [false, true]) for (const entry of ["New button", "chooser", "pending chooser pause"] as const) test(`new conversation first reply ownership: ${entry} from ${paused ? "paused" : "following"} A`, async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    const timeline = document.querySelector<HTMLElement>("#chat-timeline")!;
+    const container = document.querySelector<HTMLElement>("#chat-items")!;
+    const aBefore = () => container.querySelector('[data-chat-item-id="message:a-before"]');
+    const aPrefixHeight = () => aBefore()?.textContent?.includes("Expanded earlier A") ? 900 : 600;
+    const aTailHeight = () => container.querySelector('[data-chat-item-id="message:a-tail"]')?.textContent?.includes("Later A tail") ? 1400 : 1000;
+    const bReply = () => container.querySelector('[data-chat-item-id="message:b-reply"]');
+    const bReplyHeight = () => bReply()?.textContent?.includes("Growing reply") ? 1500 : bReply() ? 700 : 0;
+    // LinkeDOM supplies no layout. Extents advance only after the real renderer
+    // installs the corresponding snapshot/message, including native empty clamps.
+    const extent = () => aBefore() ? aPrefixHeight() + 400 + aTailHeight() : Math.max(400, 100 + bReplyHeight());
+    let top = 0;
+    Object.defineProperties(timeline, {
+      clientHeight: { configurable: true, get: () => 400 },
+      scrollHeight: { configurable: true, get: extent },
+      scrollTop: { configurable: true, get: () => { top = Math.max(0, Math.min(top, extent() - 400)); return top; },
+        set: (value: number) => { top = Math.max(0, Math.min(value, extent() - 400)); } },
+    });
+    const rect = (y: number, height: number) => ({ top: y, bottom: y + height, height, left: 0, right: 640, width: 640 }) as DOMRect;
+    timeline.getBoundingClientRect = () => rect(0, 400);
+    container.getBoundingClientRect = () => rect(-timeline.scrollTop, extent());
+    const prototype = window.HTMLElement.prototype, originalBounds = prototype.getBoundingClientRect;
+    prototype.getBoundingClientRect = function () {
+      const id = this.getAttribute("data-chat-item-id");
+      if (id === "message:a-before") return rect(-timeline.scrollTop, aPrefixHeight());
+      if (id === "message:a-reading") return rect(aPrefixHeight() - timeline.scrollTop, 400);
+      if (id === "message:a-tail") return rect(aPrefixHeight() + 400 - timeline.scrollTop, aTailHeight());
+      if (id === "message:b-prompt") return rect(-timeline.scrollTop, 100);
+      if (id === "message:b-reply") return rect(100 - timeline.scrollTop, bReplyHeight());
+      return originalBounds.call(this);
+    };
+    const aSnapshot = (expanded: boolean): ConversationSnapshot => ({ ...snapshot("one"), items: [
+      { id: "message:a-before", type: "assistant_message", createdAt: 1, markdown: expanded ? "Expanded earlier A" : "Earlier A" },
+      { id: "message:a-reading", type: "user_message", createdAt: 2, text: "Semantic reading row A" },
+      { id: "message:a-tail", type: "assistant_message", createdAt: 3, markdown: "Initial A tail" },
+    ] });
+    let created = false, aReads = 0, bReads = 0;
+    const creations: Array<string | undefined> = [];
+    const prompts: Array<{ conversationId: string; requestId: string; text: string }> = [];
+    const streams = new Map<string, Parameters<ChatApiClient["stream"]>[2]>();
+    const heldB = deferred<ConversationSnapshot>();
+    const api = questionApi(document, { capabilities: [], items: () => [] });
+    api.conversations = async () => (entry !== "New button" || created ? ["one", "two"] : ["one"]).map(conversation);
+    api.snapshot = async id => id === "one" ? aSnapshot(++aReads > 1)
+      : ++bReads === 1 && entry === "pending chooser pause" ? heldB.promise : snapshot("two");
+    api.createConversation = async agentId => { creations.push(agentId); created = true; return snapshot("two"); };
+    api.prompt = async (conversationId, requestId, text) => {
+      prompts.push({ conversationId, requestId, text });
+      return { messageId: "b-prompt", pending: false, delivery: "queue", configuration: {} };
+    };
+    api.stream = (id, _cursor, handlers) => { streams.set(id, handlers); return { close() {} }; };
+    const requestFrame = globalThis.requestAnimationFrame, cancelFrame = globalThis.cancelAnimationFrame;
+    const frames = new Map<number, FrameRequestCallback>();
+    let frameId = 0, timestamp = performance.now();
+    globalThis.requestAnimationFrame = callback => { frames.set(++frameId, callback); return frameId; };
+    globalThis.cancelAnimationFrame = id => { frames.delete(id); };
+    const drain = () => {
+      for (let count = 0; count < 40 && frames.size; count++) {
+        timestamp += 20;
+        for (const [id, callback] of [...frames]) if (frames.delete(id)) callback(timestamp);
+      }
+    };
+    const select = document.querySelector<HTMLSelectElement>("#chat-conversation-select")!;
+    const choose = (id: string) => { select.value = id; select.dispatchEvent(new window.Event("change", { bubbles: true })); };
+    const input = document.querySelector<HTMLTextAreaElement>("#chat-input")!;
+    const latest = document.querySelector<HTMLButtonElement>("#chat-latest")!;
+    try {
+      const { initChat } = await import(`./ui.ts?new-conversation-follow=${paused}-${entry}-${Date.now()}`);
+      initChat(api);
+      await waitUntil(() => { drain(); return !!aBefore() && !!streams.get("one") && timeline.scrollTop === 1600 && !input.disabled; });
+      if (paused) {
+        timeline.dispatchEvent(Object.assign(new window.Event("wheel"), { deltaY: -1 }));
+        timeline.scrollTop = 650; timeline.dispatchEvent(new window.Event("scroll"));
+        expect(container.querySelector<HTMLElement>('[data-chat-item-id="message:a-reading"]')!.getBoundingClientRect().top).toBe(-50);
+      }
+      if (entry === "New button") document.querySelector<HTMLButtonElement>("#chat-new-conversation")!.click();
+      else choose("two");
+      if (entry === "pending chooser pause") {
+        await waitUntil(() => bReads === 1); drain();
+        expect(container.querySelector("[data-chat-item-id]")).toBeNull();
+        timeline.dispatchEvent(Object.assign(new window.Event("wheel"), { deltaY: -1 }));
+        choose("one");
+        await waitUntil(() => { drain(); return !!aBefore() && !input.disabled; });
+        heldB.resolve(snapshot("two")); await flush();
+        choose("two");
+      }
+      await waitUntil(() => { drain(); return select.value === "two" && !!streams.get("two") && !aBefore() && !input.disabled; });
+      expect(creations).toHaveLength(entry === "New button" ? 1 : 0);
+      expect(bReads).toBe(entry === "pending chooser pause" ? 2 : 1);
+      expect(timeline.scrollTop).toBe(0);
+      submit(document.querySelector<HTMLFormElement>("#chat-composer")!, input, "First B prompt");
+      await waitUntil(() => { drain(); return prompts.length === 1 && !!container.querySelector('[data-chat-item-id="message:b-prompt"]'); });
+      expect(prompts[0]).toEqual({ conversationId: "two", requestId: expect.any(String), text: "First B prompt" });
+      const reply = { id: "message:b-reply", type: "assistant_message" as const, createdAt: Date.now() + 1, markdown: "First reply" };
+      streams.get("two")!.event({ type: "item.upsert", conversationId: "two", generation: "g", sequence: 1, item: reply }, "first-b-reply");
+      await waitUntil(() => { drain(); return !!bReply(); });
+      const firstReplyTop = timeline.scrollTop;
+      streams.get("two")!.event({ type: "item.upsert", conversationId: "two", generation: "g", sequence: 2,
+        item: { ...reply, markdown: "Growing reply" } }, "growing-b-reply");
+      await waitUntil(() => { drain(); return bReply()?.textContent?.includes("Growing reply") === true; });
+      const grownReplyTop = timeline.scrollTop;
+      choose("one");
+      await waitUntil(() => { drain(); return aBefore()?.textContent?.includes("Expanded earlier A") === true && !input.disabled; });
+      const restoredATop = timeline.scrollTop;
+      streams.get("one")!.event({ type: "item.upsert", conversationId: "one", generation: "g", sequence: 1,
+        item: { id: "message:a-tail", type: "assistant_message", createdAt: 3, markdown: "Later A tail" } }, "later-a-tail");
+      await waitUntil(() => { drain(); return container.textContent!.includes("Later A tail"); });
+      expect({ firstReplyTop, grownReplyTop, restoredATop, laterATop: timeline.scrollTop, aLatestHidden: latest.hidden }).toEqual({
+        firstReplyTop: entry === "pending chooser pause" ? 0 : 400,
+        grownReplyTop: entry === "pending chooser pause" ? 0 : 1200,
+        restoredATop: paused ? 950 : 1900,
+        laterATop: paused ? 950 : 2300,
+        aLatestHidden: !paused,
+      });
+    } finally {
+      heldB.resolve(snapshot("two"));
+      window.dispatchEvent(new window.Event("pagehide"));
+      globalThis.requestAnimationFrame = requestFrame;
+      globalThis.cancelAnimationFrame = cancelFrame;
+      prototype.getBoundingClientRect = originalBounds;
+      document.documentElement.setAttribute("data-chat-panel", "collapsed");
+    }
+  });
+
   for (const target of ["parent", "child"] as const) for (const paused of [false, true]) test(`${target} streamed pending question preserves ${paused ? "paused reading" : "following"} through card growth`, async () => {
     const { document, window } = parseHTML(html);
     installDomGlobals(document, window);

@@ -1152,6 +1152,10 @@ Ordinary cancellation and reader pause still clear that intent.
 The owner stages navigation restoration until an actual transcript render.
 Its existing input classification makes newer reader choices, including Latest,
 supersede that restoration; layout-only callbacks cannot manufacture a choice.
+Departure captures reading state under the displayed projection's conversation
+ID, falling back to the selected ID only while no projection is installed.
+Creation may already have selected the incoming ID for inventory reconciliation;
+that ID does not own the outgoing transcript's reading state.
 Durable capture prefers pending placement over incidental live geometry and
 preserves the original reading intent beneath a temporary answer hold. UI keeps
 per-view identity and storage, not a second pending-placement state machine.

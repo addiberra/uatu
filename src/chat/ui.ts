@@ -3122,7 +3122,9 @@ export function initChat(api = new ChatApiClient()): void {
   }
 
   const selectConversation = async (id: string, deferredStartup = false): Promise<boolean> => {
-    const outgoingId = hasSelectedConversation ? presentation.selectedId : undefined;
+    // New records its selected identity before this call for inventory reconciliation.
+    // Capture the displayed view instead, falling back to pending selection intent.
+    const outgoingId = hasSelectedConversation ? projection?.conversationId ?? presentation.selectedId : undefined;
     const openingStartup = deferredStartup || isUnestablishedStartup(id);
     supersedeStartupSelection();
     hasSelectedConversation = true;
