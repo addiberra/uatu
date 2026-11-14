@@ -134,7 +134,15 @@ unaffected.
    chronology/owner routing, overlap exceptions, provisional stage transitions
    and source-specific report/visibility counterproof that this rule replaces.
    Keep bounded execution/ownership/replay evidence needed for activity and Stop.
-   Do not reset a counter while an active recovery references it.
+    Do not reset a counter while an active recovery references it.
+
+Pending raw-history reuse must not import contradicted evidence before a future
+worker consumer can capture counters. Record-stage or positive-inbox responses
+that finish while a warm load is pending can deny its installation even if their
+requests began before registration. Use existing pending-load frontiers; keep
+installed-cache and independent activity request ordering unchanged. Retiring a
+contradicted cache entry does not cancel its current waiter, retry that read or
+grant outcome authority; a later independent read loads current native truth.
 
 ## Actual-session Attribution Acceptance
 

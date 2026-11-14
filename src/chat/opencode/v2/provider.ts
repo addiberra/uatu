@@ -1804,10 +1804,11 @@ export class OpenCodeV2Provider implements ChatProvider {
     const version = this.streamConnected ? String(this.streamGeneration) : undefined;
     const entry = this.historyReuse.peekObservation(parent, version);
     const complete = this.historyReuse.peek(parent, version);
-    if (entry && !complete && observation.started > entry.pendingAfter && (observation.reports.length || observation.overflow)) {
+    if (entry && !complete && observation.completed > entry.pendingAfter && (observation.reports.length || observation.overflow)) {
       // Launcher scope is not available until this load returns. Positive
       // parent-scoped facts deny installation of its old raw response; they
       // neither cancel current waiters nor grant a report or start more IO.
+      // Response overlap matters even when its request predates registration.
       this.historyReuse.invalidate(parent);
     }
     if (entry && complete && observation.started > entry.pendingAfter && (observation.reports.length || observation.overflow)) {
@@ -3022,17 +3023,21 @@ export class OpenCodeV2Provider implements ChatProvider {
       if (this.owns(info) && id === subject) {
         const boundary = stringValue(asRecord(info.revert).messageID) ?? null;
         // The qualified load owns visibility from registration, before a value
-        // exists or a parent consumes it. Older native requests cannot claim
-        // this load; invalidation also prevents its late value installation.
-        const order = this.historyReuse.peekObservation(subject, this.streamConnected ? String(this.streamGeneration) : undefined);
+        // exists or a parent consumes it. Overlapping responses can deny a pending
+        // load even when their request began earlier; installed values retain
+        // their request-start cutoff. Invalidation prevents late installation.
+        const version = this.streamConnected ? String(this.streamGeneration) : undefined;
+        const order = this.historyReuse.peekObservation(subject, version);
         const previous = order?.visibility;
-        if (order && observation.started > order.recordsAfter && previous && observation.started < previous.started
+        const observesLoad = order && (observation.started > order.recordsAfter
+          || this.historyReuse.peek(subject, version) === undefined && completed > order.recordsAfter);
+        if (order && observesLoad && previous && observation.started < previous.started
           && boundary !== null && previous.boundary === null) {
           // A late intermediate stage is deny-only against a load registered
           // before it. It cannot replace the newer cleared baseline, and cannot
           // affect a replacement load registered after that stage/clear pair.
           this.historyReuse.invalidate(subject);
-        } else if (order && observation.started > order.recordsAfter && (!previous || observation.started > previous.started)) {
+        } else if (order && observesLoad && (!previous || observation.started > previous.started)) {
           // Entering a staged boundary filters the same complete raw history;
           // retain it and refresh visibility/cost from the current record.
           // Leaving/changing an existing boundary can commit removed content,
